@@ -8,35 +8,107 @@ GitHub: no issue filed yet. Proposed title: *"[Feature]: Design managed durable
 storage for workloads"*.
 
 Scope: a TauGrid system contract for durable workload storage covering
-datasets, checkpoints, shared working state and outputs. Researchers keep
-`tau run` / `status` / `cancel` and get a working `/data` without naming or
-creating a PVC. Platform teams declare storage classes once on `TauCluster`.
-The `tau-core-controller` binds a per-workspace volume and reports whether it
-is usable.
+datasets, checkpoints, shared working state and outputs. **TauGrid is a control
+plane only. Every byte of data, and every I/O, caching, replication and
+durability guarantee, lives in the storage provider's data plane.** TauGrid
+declares which storage a workspace uses, binds it into the workload, gives the
+workload an identity to reach it, and reports whether it works. It never
+stores, proxies, caches or replicates data. Researchers keep `tau run` /
+`status` / `cancel` and get a working `/data` without naming or creating a
+PVC. Platform teams declare storage classes once on `TauCluster`.
 
-Primary integration: **AKS + Azure Blob Storage with hierarchical namespace
-(ADLS Gen2)**, mounted with BlobFuse2 through the Blob CSI driver and
-authenticated with the workspace's existing Azure Workload Identity. Optional
-tiers: **node-local NVMe** for scratch, and **Azure Managed Lustre (AMLFS)**
-for shared high-throughput I/O. Any RWX PVC keeps working in `External` mode.
+Providers: the API is provider-neutral. A storage class is a CSI driver, a
+parameter template, an identity mode and a set of declared capabilities
+(sections 3.0 and 6.1). **Azure (Blob with hierarchical namespace, Managed
+Lustre, local NVMe) is the first reference provider** and the one this document
+works through in detail. AWS (S3, FSx for Lustre, EFS), GCP (Cloud Storage,
+Parallelstore, Filestore) and on-prem systems (Ceph, NFS, Lustre, WEKA, VAST)
+plug in as classes, not as new controller code. Any RWX PVC keeps working in
+`External` mode.
 
 This is a **workflow and lifecycle design**. It is not a storage system, not a
-CSI driver, and not cloud provisioning ([ROADMAP.md](../../ROADMAP.md) "Not
-planned"). TauGrid manages the Kubernetes objects and the contract between
-them. Cloud resources come from IaC or from CSI dynamic provisioning.
+storage gateway, not a CSI driver, and not cloud provisioning
+([ROADMAP.md](../../ROADMAP.md) "Not planned"). TauGrid manages the Kubernetes
+objects and the contract between them. Cloud resources come from IaC. Data
+flows between workloads and the provider directly.
 
 ## Decisions proposed (review these first)
 
 | # | Decision | Consequence |
 |---|---|---|
-| D1 | **TauGrid owns storage *bindings*, never cloud resources.** The controller creates and deletes PV/PVC objects, mount wiring and directory layout. It never calls Azure Resource Manager. | Storage accounts, containers, AMLFS and role assignments come from Terraform (new opt-in module in [`terraform/aks`](../../terraform/aks)) or other IaC. Matches ROADMAP "Not planned: cloud or cluster provisioning". |
+| D0 | **TauGrid is a control plane only; the data plane is the provider's.** No TauGrid component (controller, CLI, portal, status pipeline) sits in the data path: no storage gateway, proxy, cache, replicator or sync service. | Bytes flow pod → provider CSI driver → provider service, and user or CLI → provider API directly with the caller's own credentials. A TauGrid outage cannot affect running I/O. Durability, throughput, encryption, versioning and replication are the provider's guarantees and are *declared and reported*, never provided. See section 0. |
+| D1 | **TauGrid owns storage *bindings*, never cloud resources.** The controller creates and deletes PV/PVC objects, mount wiring and the path convention. It never calls any cloud provider's resource-management API (ARM, AWS, GCP). | Storage accounts, containers, AMLFS and role assignments come from Terraform (new opt-in module in [`terraform/aks`](../../terraform/aks)) or other IaC. Matches ROADMAP "Not planned: cloud or cluster provisioning". |
 | D2 | **Reuse the TauCluster ownership vocabulary: `External` / `Adopt` / `Manage`.** The default is `External`, which is today's behavior. | Existing clusters see only new *observed* status (`StorageReady`) until an operator opts in. No researcher-visible change on upgrade. |
-| D3 | **Azure durable tier = Premium block blob account with hierarchical namespace, one container per workspace, mounted by BlobFuse2 via a static Blob CSI PV, authenticated as the workspace identity.** | Azure enforces isolation between workspaces, not only Kubernetes RBAC. Directory rename becomes a single metadata operation, which existing publish paths rely on. Depends on the Blob CSI `mountWithWorkloadIdentityToken` option, which is **preview**. See section 3.4 and open question 1. |
+| D3 | **Azure reference provider, durable tier = Premium block blob account with hierarchical namespace, one container per workspace, mounted by BlobFuse2 via a static Blob CSI PV, authenticated as the workspace identity.** | Azure enforces isolation between workspaces, not only Kubernetes RBAC. Directory rename becomes a single metadata operation, which existing publish paths rely on. Depends on the Blob CSI `mountWithWorkloadIdentityToken` option, which is **preview**. See section 3.4 and open question 1. Other providers supply an equivalent class (section 3.0); the controller has no Azure-specific code. |
 | D4 | **The in-pod path contract does not change.** `/data`, `/mnt`, the `TAU_*_DIR` variables and the layouts in [`storage/paths.go`](../../cli/internal/storage/paths.go) stay exactly as they are. | Managed storage changes *where* `/data` comes from, not what it looks like. Every example, registry and resume path keeps working. |
-| D5 | **Durability is defined by commit markers, not by POSIX semantics.** A checkpoint, dataset version or artifact set exists only once its marker is written with create-if-absent. Data goes to writer-unique generation paths. | Works the same on BlobFuse2, Lustre, NFS and the direct Blob API. Generalizes what [`artifactpublish`](../../cli/internal/artifactpublish) and the dataset registry's `If-None-Match` writes already do. |
+| D5 | **Durability is defined by commit markers, not by POSIX semantics.** A checkpoint, dataset version or artifact set exists only once its marker is written with the provider's create-if-absent primitive (a conditional write: `If-None-Match: *` on Azure Blob and S3, `ifGenerationMatch=0` on GCS, `O_EXCL` only on filesystems that honor it). Data goes to writer-unique generation paths. | A client-side convention that runs inside the workload against the provider. TauGrid stores nothing and enforces nothing. Each class declares which primitives it offers (section 4.2) and submit refuses configs that need one the class lacks. Generalizes what [`artifactpublish`](../../cli/internal/artifactpublish) and the dataset registry's `If-None-Match` writes already do. |
 | D6 | **No new required `tau.yaml` fields.** `storage.data_pvc` defaults to the workspace's managed claim from `TauWorkspace.status.storage`, the same way the queue defaults from workspace status. An explicit `data_pvc` still wins. | Checked-in configs that name `blob-training` keep working. New configs can omit storage entirely. |
 | D7 | **Scratch-on-NVMe and the AMLFS fast tier are optional, per-cluster classes**, off by default and targeted at v1.1. | v1 ships the durable tier, status and CLI. Fast tiers reuse the same API without re-litigating it. |
-| D8 | **MultiKueue stays per-cluster.** Each worker binds its own workspace volume. There is no cross-region byte replication, as in the current contract. | Same claim *name* and class on every worker. [`checkStorageClassParity`](../../cli/internal/platform/preflight.go) keeps working unchanged. |
+| D8 | **MultiKueue stays per-cluster.** Each worker binds its own workspace volume. TauGrid does not replicate data across regions or clusters, as in the current contract; cross-region replication is a provider feature a class may opt into (GRS, S3 replication, dual-region buckets). | Same claim *name* and class on every worker. [`checkStorageClassParity`](../../cli/internal/platform/preflight.go) keeps working unchanged. |
+
+---
+
+## 0. Control plane / data plane boundary
+
+This is the rule every other section is checked against.
+
+| | Control plane (TauGrid) | Data plane (provider) |
+|---|---|---|
+| Owns | Which class a workspace uses; the PV/PVC that binds it; which service account carries which identity; `StorageReady`; the `Volume mount` run phase; pre-submit checks; the path convention (`/data`, `/mnt`) | Bytes, I/O, caching, durability, replication, encryption at rest, versioning and recovery, throttling, billing, capacity, **enforcement of access (IAM)** |
+| Code that runs | `tau-core-controller`, `tau` CLI, portal | Provider CSI driver (node plugin) and the provider's storage service |
+| Failure effect | New binds and status stall; **running I/O is unaffected** | I/O errors or slowness; TauGrid can surface it, not mask it |
+| Credentials | Never holds storage credentials; references identities | Validates tokens against its own IAM |
+
+```mermaid
+flowchart LR
+  subgraph CP["Control plane: TauGrid"]
+    ctrl["tau-core-controller<br/>PV/PVC, StorageReady"]
+    cli["tau CLI and portal<br/>resolve, preflight, status"]
+  end
+  subgraph K8S["Kubernetes nodes"]
+    pod["workload pods"]
+    csi["provider CSI driver"]
+  end
+  subgraph DP["Data plane: provider"]
+    svc[("object or file service<br/>durability, IAM, replication")]
+  end
+  ctrl -. "declares and binds (objects only)" .-> csi
+  cli -. "reads status, never bytes" .-> ctrl
+  pod -- "read and write /data" --> csi
+  csi -- "bytes" --> svc
+  cli -- "tau storage: caller's own credentials" --> svc
+```
+
+Test for any feature: if it needs TauGrid to **hold, move, transform or serve
+bytes**, it is out of scope. If it can be expressed as a Kubernetes object, a
+status condition, a credential binding or a pre-submit check, it is in scope.
+
+What this rules out, and what it changes:
+
+1. **No TauGrid storage service.** `tau storage` is a client that talks to the
+   provider with the *caller's* credentials (section 8.3). It is optional and
+   no TauGrid server relays its bytes.
+2. **The helper-pod read/write path is legacy.** Today `tau run get`, the model
+   and dataset registries move file contents through a pod's logs and the
+   Kubernetes API server ([`pvc_helpers.go`](../../cli/internal/cli/pvc_helpers.go)).
+   That puts the cluster in the data path. It stays only as the `External`
+   fallback and is retired for managed workspaces.
+3. **The checkpoint protocol is a convention, not a service.** The SDK helper
+   (section 8.5) is a library inside the user's process that talks to the
+   provider. TauGrid runs no daemon for it and cannot enforce it.
+4. **Guarantees are the provider's.** TauGrid can say "the claim is bound, the
+   driver is registered and the identity is wired". It cannot say "your data is
+   durable". Classes therefore *declare capabilities* (section 4.2) and
+   TauGrid refuses configs that need a capability the class does not declare.
+5. **Failure isolation is a feature.** A controller crash, an upgrade or an
+   API-server outage leaves mounted pods reading and writing.
+
+What we give up by staying a control plane: no unified quota or `ENOSPC`
+across providers (capacity is reported where the provider exposes it, section
+9), no TauGrid-managed cross-provider data movement or replication, and no
+server-side garbage collection (`tau storage gc` is client-side). Each of those
+would need TauGrid to run in the data path. The roadmap already lists portable
+data under "Exploring", and it should be designed there.
 
 ---
 
@@ -109,7 +181,7 @@ missing.
 
 Three tiers, of which only the first two are in v1:
 
-| Tier | Mount | Backing (Azure) | Survives | Guarantees TauGrid documents | Typical content |
+| Tier | Mount | Backing (Azure example) | Survives | Guarantees (the provider's, declared per class) | Typical content |
 |---|---|---|---|---|---|
 | **Durable** (v1) | `/data` | Workspace container on an HNS Premium block blob account, BlobFuse2 | pod, node, cluster scale-to-zero, workspace deletion (`Retain`) | per-object atomic writes; create-if-absent markers; directory rename is one metadata operation (HNS) | datasets, committed checkpoints, outputs, registries |
 | **Scratch** (v1: `emptyDir`; v1.1: NVMe class) | `/mnt` | node-local disk; NVMe on GPU SKUs that have it | container restarts only | full POSIX; fast; **lost with the pod/node** | staged dataset shards, in-progress checkpoints, compile caches |
@@ -122,9 +194,50 @@ protocol themselves.
 
 ---
 
-## 3. Cloud infrastructure (Azure first)
+## 3. Providers and cloud infrastructure (Azure is the first reference provider)
 
-### 3.1 Reference architecture
+### 3.0 Provider model
+
+The controller contains **no provider-specific code**. A storage class
+(section 6.1) is data:
+
+* `csi.driver`: which CSI driver mounts it. Must be on the controller's
+  allow-list.
+* `csi.volumeAttributes` and `volumeHandle`: a template. The only substitutions are `{workspace}`,
+  `{namespace}`, `{serviceAccount}` and `{identity.*}`, so rendering a PV is string
+  substitution plus validation.
+* `identity.mode`: `workloadIdentity` (the pod's service account is federated
+  to a cloud identity authorized on that workspace's data only), `nodeIdentity`
+  (shared, visible as a warning) or `none`.
+* `capabilities`: what the provider and driver can do (section 4.2).
+
+Adding a provider means adding a class preset and a documentation page. It
+does not mean a new controller, a new CRD version or new Go code. Azure ships as
+the first preset and Terraform module because that is where TauGrid is tested
+end to end.
+
+| | Azure (reference) | AWS | GCP | On-prem / other |
+|---|---|---|---|---|
+| Durable object tier | Blob + hierarchical namespace, `blob.csi.azure.com` (BlobFuse2) | S3 via Mountpoint CSI, `s3.csi.aws.com`; **static provisioning only** (verified) | Cloud Storage via GCS FUSE CSI, `gcsfuse.csi.storage.gke.io` (confirm) | Ceph RGW or MinIO through an S3 CSI, or any RWX filesystem |
+| Shared POSIX fast tier | Managed Lustre, `azurelustre.csi.azure.com` | FSx for Lustre `fsx.csi.aws.com`, EFS `efs.csi.aws.com` (confirm) | Parallelstore, Filestore (confirm) | Lustre, CephFS, WEKA, VAST, NFS |
+| Node-local scratch | local NVMe (Azure Container Storage local CSI) | instance-store NVMe | Local SSD | node disks |
+| Pod → storage identity | Workload identity: UAMI federated to the service account. The Blob CSI option is **preview** (verified) | IAM roles for service accounts or EKS Pod Identity (confirm per driver version) | Workload Identity Federation for GKE (verified). Uniform bucket-level access is required for read-write (verified) | the system's own (Kerberos, tokens, export policies) |
+| Conditional create through the API | `If-None-Match: *`, used today by [`sdkAzBackend`](../../cli/internal/cli/dataset_sdk_backend.go) | `If-None-Match: *`, **412** on conflict (verified) | `ifGenerationMatch=0` (confirm) | `O_EXCL` on a POSIX filesystem |
+| Directory rename on the object tier | atomic with HNS, per-object without (verified) | **not supported on any S3 bucket type**; file rename only on S3 Express One Zone (verified) | atomic folder rename on HNS buckets (confirm) | native |
+| Write model through the mount | BlobFuse2: concurrent writers to one file give unexpected results (verified) | Mountpoint: sequential writes, one writer, no locks, no `chmod`; overwriting needs an opt-in flag (verified) | see GCS FUSE semantics (confirm) | filesystem-specific |
+
+"verified" means read in vendor documentation while writing this design
+([Mountpoint semantics](https://github.com/awslabs/mountpoint-s3/blob/main/doc/SEMANTICS.md),
+[S3 conditional writes](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html),
+[GCS FUSE CSI](https://docs.cloud.google.com/kubernetes-engine/docs/concepts/cloud-storage-fuse-csi-driver),
+and the Azure pages cited below). "confirm" means taken from prior knowledge and
+**must be re-checked against the driver version** before a preset ships. Driver
+names and option spellings in section 6.1's AWS and GCP examples are
+illustrative for the same reason.
+
+The rest of section 3 is the Azure reference provider in detail.
+
+### 3.1 Azure reference architecture
 
 ```mermaid
 flowchart LR
@@ -177,7 +290,7 @@ What each Azure resource is for, and who creates it:
 The controller needs **no Azure credentials**. It reads the account and
 container names from `TauCluster.spec.storage` and writes Kubernetes objects.
 
-### 3.2 Durable tier: options considered
+### 3.2 Azure durable tier: options considered
 
 | Option | Dir rename | Multi-writer to one file | Throughput scaling | Cost model | Isolation per workspace | Verdict |
 |---|---|---|---|---|---|---|
@@ -416,12 +529,16 @@ that `shared_access_key_enabled = false` is fine for BlobFuse2 with identity
 auth. It does break any tool that silently falls back to keys, which is the
 point.
 
-### 3.10 Other environments
+### 3.10 Other providers
 
-`External` mode is backend-agnostic and stays the escape hatch: any Bound RWX
-PVC works (Azure Files, ANF, NFS, CephFS, GCS FUSE, Mountpoint for S3). The
-`Manage` reconciler is pluggable by `backend.type`. v1 implements
-`azureBlobHNS` only. A GCS or S3 backend would add a PV template, not a new API.
+`External` mode is provider-agnostic and stays the escape hatch: any Bound RWX
+PVC works. For `Adopt` and `Manage`, a provider needs only a CSI driver that
+supports static PVs with per-volume attributes, plus a pod-identity story that
+can be scoped to one workspace's data. Section 3.0 lists what that looks like on
+AWS, GCP and on-prem, and section 6.1 gives class examples. The S3 column is the
+useful stress test: it has no directory rename at all, which is why the
+commit-marker convention (section 4.2) is designed to need none on the durable
+tier.
 
 ---
 
@@ -474,33 +591,54 @@ tau workspace status team-a                                     # now shows a St
 * `tau run get`, `tau data model`, `tau data dataset` use the same backend
   (section 8.3). They stop assuming the claim is `blob-training`.
 
-### 4.2 The durability contract (what researchers may rely on)
+### 4.2 Capability contract and the commit-marker convention
 
-| Operation on `/data` | Guarantee | Not guaranteed |
-|---|---|---|
-| Write a file, close, read back from the same pod | visible | — |
-| Same file read from another pod/node | visible after close + attribute cache timeout (≤ class `attrTimeout`) | instant visibility |
-| Two writers to one path | — | **anything**; last writer wins |
-| `rename(dir)` on the same volume | single metadata operation (HNS) | atomicity *across* a crash of the BlobFuse2 process mid-call |
-| Create a marker with `O_EXCL` / `If-None-Match:*` | exactly one creator succeeds | — |
-| Listing a directory | eventually complete | completeness immediately after another node's write |
-| `flock`, hard links, `chmod` effect | — | not supported (BlobFuse2) |
+TauGrid does not provide these guarantees; the provider does. Each class
+**declares** them (section 6.1 `capabilities`), `tau workspace status` shows
+them, submit-time preflight reads them, and the convention below needs only the
+minimum.
 
-The protocol built on those guarantees (implemented in the prototype and in
-the proposed SDK helper):
+| Capability | Why it matters | Azure Blob + HNS (BlobFuse2) | S3 (Mountpoint) | GCS (GCS FUSE) | POSIX FS (Lustre, NFS, CephFS) |
+|---|---|---|---|---|---|
+| `conditionalCreate` (provider API) | one winner for a commit marker | yes | yes (verified) | yes (confirm) | n/a |
+| `conditionalCreateOnMount` | same, through `/data` | **not documented; treat as no** until the phase-2 test | not documented; treat as no | not documented; treat as no | yes (`O_EXCL`; NFS depends on version) |
+| `atomicFileRename` | temp-then-rename for single files | yes with HNS | **no** (general purpose buckets) | confirm | yes |
+| `atomicDirRename` | publish a directory in one step | yes with HNS | **no** | confirm (HNS buckets) | yes |
+| `multiWriterSameFile` | two ranks writing one path | no (last writer wins) | no (one writer) | no | yes, with locks where supported |
+| `posixLocks` | `flock` coordination | no | no | no | yes where the mount enables it |
+| `readAfterWriteOnMount` | seeing another node's write | within the attribute-cache timeout | strong by default, relaxed with caching (verified) | confirm | strong |
+
+Consequences enforced at submit, not at 3 a.m.:
+
+* `storage.publish: staged` and the SDK's `CheckpointManager` require
+  `conditionalCreate` **or** `conditionalCreateOnMount`. A class with neither is
+  refused with the missing capability named. There is no silent downgrade.
+* Multi-rank writers are told to write from rank 0 only when
+  `multiWriterSameFile` is false, which is the case on every object-store class.
+
+The convention (implemented in the prototype and proposed as the SDK helper):
 
 1. Write the checkpoint to `/mnt/.../step-N.partial/`, fsync, then rename to
-   `step-N/` (local and atomic).
-2. Upload files to `/data/checkpoints/<run>/step-N/<generation>/`, where
+   `step-N/`. This is local scratch, so rename always works.
+2. Upload files to `checkpoints/<run>/step-N/<generation>/`, where
    `generation = g-<attempt>-<random>`. No two writers ever share a data path.
-3. Write `/data/checkpoints/<run>/step-N/_COMMITTED.json` with
-   create-if-absent. It names the generation and lists every file's size and
-   sha256.
+   On classes with `atomicFileRename=false` the file is written directly:
+   object stores make a file visible only when the upload completes, so no
+   temp-and-rename is needed or possible.
+3. Write `checkpoints/<run>/step-N/_COMMITTED.json` **through the provider's
+   conditional-create primitive**, not through a plain mount write unless the
+   class declares `conditionalCreateOnMount`. It names the generation and lists
+   every file's size and sha256.
 4. Readers consider only steps with a marker, newest first, and verify sizes
    and hashes before loading. A failed verification falls back to the next
    older step.
 5. Retention deletes the marker *before* the data, and garbage-collects
    generations that no marker names.
+
+The convention uses **no rename on the durable tier**, so it runs unchanged on
+S3 general-purpose buckets, where directory rename does not exist. HNS rename on
+Azure is an optimization for publish paths that already rely on it, not a
+requirement.
 
 Datasets use the same marker under `datasets/<name>/<version>/`. Versions are
 immutable, so a second publish of `v1` is refused.
@@ -566,9 +704,9 @@ flowchart TB
 | Terraform / IaC | Accounts, containers, AMLFS, identities, federation, role assignments, private endpoints | Kubernetes objects |
 | `TauCluster.spec.storage` | Named classes: backend, account, mount options, auth mode, scratch and fast tiers | Per-workspace state |
 | Workspace storage reconciler (new, in `tau-core-controller`) | PV/PVC create, adopt and delete for its workspace; `StorageReady`; `status.storage`; finalizer cleanup of *objects* | Bytes; Azure APIs; CSI driver install |
-| Blob CSI / BlobFuse2 | Mounting, caching, token exchange | Layout, semantics beyond the FUSE contract |
+| Provider CSI driver and storage service (**the data plane**) | Mounting, caching, token exchange, all I/O, durability, replication, encryption, versioning, IAM enforcement | Anything TauGrid decides: classes, bindings, status |
 | tau CLI | Default `data_pvc` from status; preflight; Volume mount phase; `tau storage` | Creating PVCs |
-| tau SDK | Commit-marker protocol, hot/durable staging, resume selection | Mounts |
+| tau SDK (library inside the workload, not a service) | Commit-marker convention, hot/durable staging, resume selection | Mounts; any server-side behavior |
 | Kueue / scheduler | Admission and placement (unchanged). Storage is not a Kueue resource in v1 | Storage capacity |
 
 ---
@@ -588,32 +726,62 @@ type TauClusterStorageSpec struct {
     Scratch *TauScratchSpec    `json:"scratch,omitempty"` // v1.1
 }
 
+// A class is data. The controller renders a PV from it by substitution and
+// validation only; there is no provider-specific code path.
 type TauStorageClass struct {
     Name string `json:"name"`
     // +kubebuilder:validation:Enum=Durable;SharedFast
-    Tier    string            `json:"tier"`
-    Backend TauStorageBackend `json:"backend"`
-    // +kubebuilder:validation:Enum=workloadIdentity;nodeIdentity
-    // +kubebuilder:default=workloadIdentity
-    Auth string `json:"auth,omitempty"`
-    // MountOptions are appended to the rendered PV. Validated against an allow-list.
-    MountOptions []string `json:"mountOptions,omitempty"`
-    // ContainerTemplate names the per-workspace container; default "ws-{workspace}".
-    ContainerTemplate string `json:"containerTemplate,omitempty"`
-    // Capacity is advisory on Blob and is reported, not enforced (section 9).
+    Tier string `json:"tier"`
+    // Provider is a label for humans and metrics (azure, aws, gcp, onprem).
+    Provider     string                 `json:"provider,omitempty"`
+    CSI          TauStorageCSI          `json:"csi"`
+    Identity     TauStorageIdentity     `json:"identity,omitempty"`
+    Capabilities TauStorageCapabilities `json:"capabilities,omitempty"`
+    // Endpoint tells the optional client-side `tau storage` where the data
+    // plane is. TauGrid never connects to it.
+    Endpoint *TauStorageEndpoint `json:"endpoint,omitempty"`
+    // Capacity is advisory unless the provider enforces it (section 9).
     Capacity resource.Quantity `json:"capacity,omitempty"`
 }
 
-type TauStorageBackend struct {
-    // +kubebuilder:validation:Enum=azureBlobHNS;azureLustre
-    Type           string `json:"type"`
-    StorageAccount string `json:"storageAccount,omitempty"`
-    ResourceGroup  string `json:"resourceGroup,omitempty"`
-    // Lustre (v1.1)
-    MGSAddress string `json:"mgsAddress,omitempty"`
-    Zone       string `json:"zone,omitempty"`
+type TauStorageCSI struct {
+    // Driver must be in the controller's allow-list (Helm: storage.allowedDrivers).
+    Driver string `json:"driver"`
+    // VolumeHandleTemplate and VolumeAttributes accept {workspace}, {namespace},
+    // {serviceAccount} and {identity.<key>}. Unknown placeholders are rejected.
+    VolumeHandleTemplate string            `json:"volumeHandleTemplate"`
+    VolumeAttributes     map[string]string `json:"volumeAttributes,omitempty"`
+    // MountOptions are validated against a per-driver allow-list.
+    MountOptions []string `json:"mountOptions,omitempty"`
+}
+
+type TauStorageIdentity struct {
+    // +kubebuilder:validation:Enum=workloadIdentity;nodeIdentity;none
+    // +kubebuilder:default=workloadIdentity
+    Mode string `json:"mode,omitempty"`
+}
+
+type TauStorageCapabilities struct {
+    ConditionalCreate        bool   `json:"conditionalCreate,omitempty"`
+    ConditionalCreateOnMount bool   `json:"conditionalCreateOnMount,omitempty"`
+    AtomicFileRename         bool   `json:"atomicFileRename,omitempty"`
+    AtomicDirRename          bool   `json:"atomicDirRename,omitempty"`
+    MultiWriterSameFile      bool   `json:"multiWriterSameFile,omitempty"`
+    PosixLocks               bool   `json:"posixLocks,omitempty"`
+    // +kubebuilder:validation:Enum=strong;cacheBounded
+    ReadAfterWriteOnMount string `json:"readAfterWriteOnMount,omitempty"`
+}
+
+type TauStorageEndpoint struct {
+    // Scheme is a hint for the client: abfss, s3, gs, file.
+    Scheme string `json:"scheme"`
+    // URLTemplate and ContainerTemplate accept the same placeholders.
+    URLTemplate       string `json:"urlTemplate,omitempty"`
+    ContainerTemplate string `json:"containerTemplate,omitempty"`
 }
 ```
+
+Azure (the reference preset, rendered into the PV in section 3.3):
 
 ```yaml
 apiVersion: tau.azure.com/v1alpha1
@@ -624,15 +792,56 @@ spec:
     defaultClass: durable
     classes:
       - name: durable
+        provider: azure
         tier: Durable
-        backend: {type: azureBlobHNS, storageAccount: taugrid3f1c, resourceGroup: rg-taugrid-data}
-        auth: workloadIdentity
-        mountOptions: ["--block-cache", "--block-cache-block-size=16", "--attr-timeout=120"]
+        csi:
+          driver: blob.csi.azure.com
+          volumeHandleTemplate: "taugrid3f1c#ws-{workspace}#tau-{workspace}"
+          volumeAttributes:
+            storageAccount: taugrid3f1c
+            resourceGroup: rg-taugrid-data
+            containerName: "ws-{workspace}"
+            protocol: fuse2
+            ClientID: "{identity.clientId}"
+            mountWithWorkloadIdentityToken: "true"
+          mountOptions: ["--use-adls=true", "--block-cache", "--block-cache-block-size=16", "--attr-timeout=120"]
+        identity: {mode: workloadIdentity}
+        capabilities: {conditionalCreate: true, atomicFileRename: true, atomicDirRename: true, readAfterWriteOnMount: cacheBounded}
+        endpoint: {scheme: abfss, urlTemplate: "https://taugrid3f1c.dfs.core.windows.net", containerTemplate: "ws-{workspace}"}
+```
+
+AWS and GCP classes have the same shape. They are **illustrative**: driver names
+and option spellings must be confirmed against the driver version (section 3.0):
+
+```yaml
+      - name: durable
+        provider: aws
+        tier: Durable
+        csi:
+          driver: s3.csi.aws.com
+          volumeHandleTemplate: "taugrid-{workspace}"
+          volumeAttributes: {bucketName: "taugrid-{workspace}"}
+          mountOptions: ["region us-east-1"]
+        identity: {mode: workloadIdentity}    # annotation on the SA, see open question 7
+        capabilities: {conditionalCreate: true, readAfterWriteOnMount: strong}   # no rename, one writer
+        endpoint: {scheme: s3, containerTemplate: "taugrid-{workspace}"}
+      - name: durable
+        provider: gcp
+        tier: Durable
+        csi:
+          driver: gcsfuse.csi.storage.gke.io
+          volumeHandleTemplate: "taugrid-{workspace}"
+          volumeAttributes: {bucketName: "taugrid-{workspace}"}
+          mountOptions: ["implicit-dirs"]
+        identity: {mode: workloadIdentity}
+        capabilities: {conditionalCreate: true}
+        endpoint: {scheme: gs, containerTemplate: "taugrid-{workspace}"}
 ```
 
 New condition on TauCluster: `StorageClassesReady`. It is `True` when every
-class validates, the `blob.csi.azure.com` `CSIDriver` object exists, and at
-least one schedulable node registers it.
+class validates (known driver, known placeholders, allowed mount options), each
+class's `CSIDriver` object exists, and at least one schedulable node registers
+it.
 
 ### 6.2 `TauWorkspace.spec.storage` and status
 
@@ -666,9 +875,9 @@ type WorkspaceStorageStatus struct {
 }
 
 type WorkspaceStorageEndpoint struct {
-    Type      string `json:"type"`                // azureBlobHNS
-    URL       string `json:"url"`                 // https://<account>.dfs.core.windows.net
-    Container string `json:"container"`
+    Scheme    string `json:"scheme"`              // abfss | s3 | gs | file
+    URL       string `json:"url,omitempty"`       // https://<account>.dfs.core.windows.net
+    Container string `json:"container,omitempty"`
 }
 
 const ConditionStorageReady = "StorageReady"
@@ -689,7 +898,7 @@ status:
     mode: Manage
     claimName: tau-data
     class: durable
-    endpoint: {type: azureBlobHNS, url: "https://taugrid3f1c.dfs.core.windows.net", container: ws-team-a}
+    endpoint: {scheme: abfss, url: "https://taugrid3f1c.dfs.core.windows.net", container: ws-team-a}
   conditions:
     - {type: StorageReady, status: "True", reason: ManagedVolumeBound}
 ```
@@ -748,7 +957,7 @@ The researcher ClusterRole is **not** widened.
 |---|---|---|---|
 | TauCluster (new `observeStorageClasses`) | TauCluster, CSIDriver, CSINode | `TauCluster.status` (`StorageClassesReady`) | no `spec.storage` |
 | TauWorkspace (new step `reconcileStorage`) | TauWorkspace, owned PV/PVC, TauCluster | PV, PVC, `TauWorkspace.status.storage`, `StorageReady` | `spec.storage` absent, or the workspace is not primary |
-| Blob CSI | PV/PVC, pods | mounts | — |
+| Provider CSI driver (data plane, not TauGrid) | PV/PVC, pods | mounts and all I/O | — |
 | tau CLI | (client) | Job/RayJob | — |
 
 `reconcileStorage` slots into
@@ -770,9 +979,10 @@ reconcileStorage(ws, ns):
     as External, then label PVC+PV with workspace ownership if unlabeled;
     refuse (OwnershipConflict) if labeled for another workspace
   Manage:
-    if class.auth == workloadIdentity && ws.spec.workloadIdentity == nil:
+    if class.identity.mode == workloadIdentity && ws.spec.workloadIdentity == nil:
         return False/WorkloadIdentityRequired
-    desiredPV  := renderPV(class, ws)    // deterministic; hash in annotation
+    desiredPV  := renderPV(class, ws)    // template substitution + validation only;
+                                         // deterministic, hash in annotation
     desiredPVC := renderPVC(ws, ns)
     createOrValidate(desiredPV)          // PV spec is mostly immutable:
                                          // on drift -> DriftDetected, never mutate in place
@@ -786,7 +996,7 @@ reconcileStorage(ws, ns):
 Two deliberate limits:
 
 * **No mount probe pod in the controller.** A Bound PV says nothing about
-  whether Azure accepts the token. Proving the mount needs a pod. The
+  whether the provider accepts the token. Proving the mount needs a pod. The
   controller should not schedule pods into research namespaces on every
   resync. Mount health comes from real runs (section 8.2) and from an
   explicit `tau workspace check-storage` that runs one short probe pod as the
@@ -850,12 +1060,16 @@ and read-only (researchers already have `get` on PVCs).
 implementations, `pvcBackend` (helper pods) and `sdkAzBackend` (Azure SDK with
 conditional writes). The design promotes that interface to
 `cli/internal/storage/backend` and selects the implementation from workspace
-status:
+status. Implementations are **client-side and optional**. They run in the
+caller's process with the caller's credentials, and no TauGrid server component
+implements a data backend (D0):
 
-| `status.storage.endpoint.type` | Backend | Auth |
+| `status.storage.endpoint.scheme` | Backend (client-side) | Auth |
 |---|---|---|
-| `azureBlobHNS` | Azure SDK (`azdatalake` for rename and ACL-free directory ops, `azblob` for data) | the user's `DefaultAzureCredential` (az login, Entra), authorized by the container-scoped data role from Terraform |
-| absent (`External` mode, unknown backend) | helper pod, as today | Kubernetes RBAC |
+| `abfss` | Azure SDK (`azdatalake` for directory ops, `azblob` for data). **Ships in v1** | the user's `DefaultAzureCredential` (az login, Entra), authorized by the container-scoped data role from IaC |
+| `s3` | AWS SDK. Same interface, follow-up | the caller's AWS credential chain |
+| `gs` | Cloud Storage client. Same interface, follow-up | Application Default Credentials |
+| absent, or a scheme with no backend | helper pod, as today (legacy) | Kubernetes RBAC |
 
 Consequences:
 
@@ -932,6 +1146,10 @@ data movement stays out of scope, as in ROADMAP "Exploring: portable data".
 | 16 | AMLFS rename/delete not exported to Blob (v1.1) | Durable marker is written after export, never inferred from Lustre state | SDK fast-tier mode |
 | 17 | Cross-region mount attempted | Prevented: one account per region; class carries region; MultiKueue workers have their own | Terraform; preflight parity |
 | 18 | Researcher mounts another workspace's container via an inline CSI volume | Azure refuses the token (workload identity mode) | Azure RBAC |
+| 19 | Class lacks both conditional-create capabilities but the run sets `storage.publish: staged` or uses the SDK | Submit refused with the missing capability named; no silent downgrade | CLI preflight reading class capabilities |
+| 20 | `tau-core-controller` or the API server is unavailable mid-run | Mounted pods keep reading and writing. Only new binds and status updates stall until recovery | control/data separation (D0) |
+| 21 | Provider outage or throttling | Appears as I/O errors, slow I/O and `Volume mount` warnings. TauGrid cannot mask it and does not retry on the provider's behalf | provider; status phase |
+| 22 | The convention would need a rename on the durable tier (S3 general-purpose buckets) | It does not: generation paths plus a conditional-create marker need no rename; single files are written directly when `atomicFileRename=false` | SDK reading class capabilities |
 
 The silent failure this design exists to remove: *a workspace is `Ready`, a
 run starts, writes "checkpoints" to a mount whose semantics nobody
@@ -954,6 +1172,8 @@ explained, and the resume picks up a half-written directory.*
 | New `TauVolume` CRD per volume | Workspace-scoped spec covers v1. A `TauVolume` for *shared read-only* datasets across workspaces is a natural v2 once `storage.inputs` exists. |
 | Make storage a Kueue resource (quota) | Blob capacity is elastic; admission-time storage quota adds coupling without preventing anything. Revisit for AMLFS capacity. |
 | Write checkpoints directly to `/data` with rename as commit | Works only on HNS and only within one mount. Breaks on flat namespace, Lustre→Blob export and direct API writers. Markers work everywhere. |
+| TauGrid-hosted storage gateway, cache or sync service | Puts TauGrid in the data path: throughput bottleneck, new availability and security surface, and a re-implementation of what provider storage already does. Violates D0 |
+| Provider-specific reconcilers in the controller (`azure.go`, `aws.go`, `gcp.go`) | Couples releases to provider API churn and grows the controller's attack surface. A class template plus validation gives the same result with data instead of code |
 
 ---
 
@@ -1005,8 +1225,21 @@ which is phase 2's job (11.3, item 6).
 
 What the prototype does **not** prove: BlobFuse2 mount behavior, workload
 identity, HNS rename, AKS scheduling or the controller. Azurite is a
-flat-namespace emulator. That the protocol passes there is the point: it
-does not need rename.
+flat-namespace emulator. That the protocol passes there is the point: the Blob
+API path needs no rename.
+
+Two limits of the prototype that the design above already accounts for:
+
+* **Create-if-absent on a mount is unproven.** The `posix` store makes the
+  marker with `O_EXCL`, which real POSIX filesystems (Lustre, most NFS) honor.
+  BlobFuse2 and Mountpoint document no such guarantee. The design therefore
+  writes markers through the provider API (the `blob` store path) unless a class
+  declares `conditionalCreateOnMount`, and phase 2 tests the mount behavior.
+* **`PosixStore` assumes `atomicFileRename`.** It writes single files by
+  temp-and-rename, which is true on Lustre, NFS and HNS but false on S3
+  general-purpose buckets. A capability-aware store that writes directly when
+  the class declares `atomicFileRename=false` is part of the SDK work, not of
+  this prototype.
 
 Reproduce:
 
@@ -1031,6 +1264,10 @@ python run_scenarios.py --backend posix --backend blob
    `mountWithWorkloadIdentityToken` (failure mode 14).
 6. Throughput baseline on one ND H100 v5 node: `/mnt` NVMe vs `/data`
    BlobFuse2 block-cache, for sequential checkpoint write and shard read.
+7. Create-if-absent through the mount: two pods race to create the same marker
+   path via BlobFuse2 `O_EXCL` and record whether exactly one wins. Repeat per
+   provider driver (Mountpoint, GCS FUSE) before a class may declare
+   `conditionalCreateOnMount`.
 
 ---
 
@@ -1060,7 +1297,8 @@ and everything keeps its name. Moving bytes to an HNS container is a one-time
 6. Terraform: `storage.tf`, variables, outputs, `storage_profile { blob_driver_enabled = true }`, values rendering; `terraform/aks/tests`.
 7. Docs: replace the "post-0.1 fast-follow" paragraph in the storage README; new site page "Storage"; troubleshooting entries for the Volume mount hints.
 8. E2E: Kind External-mode test (hostPath RWX PVC); AKS phase-2 lab from 11.3.
-9. `python3 scripts/check-license-headers.py`.
+9. Provider presets as Helm values (Azure first), the driver and mount-option allow-lists, and one documentation page each for Azure, AWS, GCP and on-prem classes.
+10. `python3 scripts/check-license-headers.py`.
 
 ---
 
@@ -1083,6 +1321,19 @@ and everything keeps its name. Moving bytes to an HNS container is a one-time
    roadmap?
 6. **Versioning on HNS.** Confirm current Azure support before promising any
    point-in-time recovery beyond soft delete.
+7. **Identity API shape.** `TauWorkspace.spec.workloadIdentity.clientId` is
+   Azure-shaped. Other providers bind identity by service-account annotation (an
+   IAM role ARN, a Google service account). Recommendation: add a generic
+   `workloadIdentity.annotations` map beside `clientId` and keep `clientId` for
+   compatibility.
+8. **Declared vs probed capabilities.** Classes declare capabilities, and
+   `tau workspace check-storage` could verify them (conditional create, rename,
+   read-after-write) and set a condition on mismatch. Recommendation: declare,
+   then verify in the probe.
+9. **Who owns the convention?** The commit-marker format is a public contract
+   between TauGrid tooling and user code. Recommendation: version it as a short
+   spec (`tau.azure.com/commit-marker/v1`) so SDKs in other languages can
+   implement it.
 
 ---
 
@@ -1097,3 +1348,7 @@ and everything keeps its name. Moving bytes to an HNS container is a one-time
 - [Tiered checkpoints for AI training with Azure Managed Lustre](https://docs.azure.cn/en-us/azure-managed-lustre/tiered-checkpoints)
 - [Best practices for ephemeral NVMe data disks in AKS](https://docs.azure.cn/en-us/aks/best-practices-storage-nvme)
 - [Azure Container Storage v2 GA](https://blog.aks.azure.com/2025/09/15/acstor-v2-ga)
+- [Mountpoint for Amazon S3 CSI driver on EKS](https://docs.aws.amazon.com/eks/latest/userguide/s3-csi.md)
+- [Mountpoint for Amazon S3 file system semantics](https://github.com/awslabs/mountpoint-s3/blob/main/doc/SEMANTICS.md)
+- [Amazon S3 conditional writes](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html)
+- [Cloud Storage FUSE CSI driver for GKE](https://docs.cloud.google.com/kubernetes-engine/docs/concepts/cloud-storage-fuse-csi-driver)
