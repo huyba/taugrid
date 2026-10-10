@@ -1,0 +1,198 @@
+{
+  "python": "3.13.16",
+  "backends": {
+    "posix": {
+      "s1": {
+        "scenario": "S1 success: stage dataset, train, async commits, retention",
+        "status": "PASS",
+        "seconds": 25.0,
+        "committed": [
+          100,
+          150,
+          200
+        ],
+        "val_loss_first": 2.897,
+        "val_loss_last": 2.459,
+        "median_ckpt_blocking_ms": 26.8,
+        "median_durable_commit_ms": 56.2,
+        "ckpt_mb": 10.16
+      },
+      "s2": {
+        "scenario": "S2 torn upload: crash after data upload, before commit marker",
+        "status": "PASS",
+        "seconds": 32.3,
+        "after_crash": {
+          "committed": [
+            50,
+            100
+          ],
+          "torn": [
+            150
+          ]
+        },
+        "resumed_from": 100,
+        "final_committed": [
+          100,
+          150,
+          200
+        ]
+      },
+      "s3": {
+        "scenario": "S3 node loss: committed checkpoint, hot tier wiped, resume from durable",
+        "status": "PASS",
+        "seconds": 29.9,
+        "same_node_restart": "hot cache hit",
+        "new_node_restart": "durable restore",
+        "resumed_from": 150,
+        "dataset_stage_new_node": {
+          "cache_hits": 0,
+          "downloaded": 5
+        }
+      },
+      "s4": {
+        "scenario": "S4 zombie writer: second commit of an existing step is refused",
+        "status": "PASS",
+        "seconds": 0.1,
+        "second_commit_accepted": false,
+        "marker_owner_attempt": "0",
+        "restored_content": "writer-A (intact)",
+        "generations_left": 1
+      },
+      "s5": {
+        "scenario": "S5 sync vs async durable commit (training stall per checkpoint)",
+        "status": "PASS",
+        "seconds": 24.1,
+        "median_block_sync_ms": 54.7,
+        "median_block_async_ms": 26.8
+      },
+      "s6": {
+        "scenario": "S6 dataset immutability and verification",
+        "status": "PASS",
+        "seconds": 0.2,
+        "republish_v1": "refused",
+        "first_stage": {
+          "cache_hits": 0,
+          "downloaded": 5
+        },
+        "second_stage": {
+          "cache_hits": 5,
+          "downloaded": 0
+        },
+        "after_local_corruption": {
+          "cache_hits": 4,
+          "downloaded": 1
+        },
+        "uncommitted_version": "refused"
+      },
+      "s7": {
+        "scenario": "S7 distributed (torchrun, 2 ranks, gloo): crash and resume, rank-0 writer",
+        "status": "PASS",
+        "seconds": 38.2,
+        "world": 2,
+        "resumed_from": 50,
+        "final_committed": [
+          50,
+          75,
+          100
+        ]
+      }
+    },
+    "blob": {
+      "s1": {
+        "scenario": "S1 success: stage dataset, train, async commits, retention",
+        "status": "PASS",
+        "seconds": 26.5,
+        "committed": [
+          100,
+          150,
+          200
+        ],
+        "val_loss_first": 2.897,
+        "val_loss_last": 2.459,
+        "median_ckpt_blocking_ms": 26.1,
+        "median_durable_commit_ms": 88.8,
+        "ckpt_mb": 10.16
+      },
+      "s2": {
+        "scenario": "S2 torn upload: crash after data upload, before commit marker",
+        "status": "PASS",
+        "seconds": 33.6,
+        "after_crash": {
+          "committed": [
+            50,
+            100
+          ],
+          "torn": [
+            150
+          ]
+        },
+        "resumed_from": 100,
+        "final_committed": [
+          100,
+          150,
+          200
+        ]
+      },
+      "s3": {
+        "scenario": "S3 node loss: committed checkpoint, hot tier wiped, resume from durable",
+        "status": "PASS",
+        "seconds": 30.2,
+        "same_node_restart": "hot cache hit",
+        "new_node_restart": "durable restore",
+        "resumed_from": 150,
+        "dataset_stage_new_node": {
+          "cache_hits": 0,
+          "downloaded": 5
+        }
+      },
+      "s4": {
+        "scenario": "S4 zombie writer: second commit of an existing step is refused",
+        "status": "PASS",
+        "seconds": 0.2,
+        "second_commit_accepted": false,
+        "marker_owner_attempt": "0",
+        "restored_content": "writer-A (intact)",
+        "generations_left": 1
+      },
+      "s5": {
+        "scenario": "S5 sync vs async durable commit (training stall per checkpoint)",
+        "status": "PASS",
+        "seconds": 25.6,
+        "median_block_sync_ms": 149.8,
+        "median_block_async_ms": 26.1
+      },
+      "s6": {
+        "scenario": "S6 dataset immutability and verification",
+        "status": "PASS",
+        "seconds": 0.4,
+        "republish_v1": "refused",
+        "first_stage": {
+          "cache_hits": 0,
+          "downloaded": 5
+        },
+        "second_stage": {
+          "cache_hits": 5,
+          "downloaded": 0
+        },
+        "after_local_corruption": {
+          "cache_hits": 4,
+          "downloaded": 1
+        },
+        "uncommitted_version": "refused"
+      },
+      "s7": {
+        "scenario": "S7 distributed (torchrun, 2 ranks, gloo): crash and resume, rank-0 writer",
+        "status": "PASS",
+        "seconds": 37.8,
+        "world": 2,
+        "resumed_from": 50,
+        "final_committed": [
+          50,
+          75,
+          100
+        ]
+      }
+    }
+  },
+  "torch": "2.14.1+cu130"
+}
