@@ -643,6 +643,52 @@ requirement.
 Datasets use the same marker under `datasets/<name>/<version>/`. Versions are
 immutable, so a second publish of `v1` is refused.
 
+The same convention as an activity diagram. The left lane is what a run does
+while training; the right lane is what a restarted run does. The hot tier is
+local scratch (`/mnt`), so the blocking part of a save is only the local write.
+
+```mermaid
+flowchart TB
+  subgraph SAVE["Save at step N (rank 0)"]
+    direction TB
+    s1[Write step-N.partial on /mnt, fsync]
+    s2[Rename to step-N on /mnt<br/>local, always atomic]
+    s3[Training loop continues<br/>blocking time ends here]
+    s4[Background: upload files to<br/>checkpoints/run/step-N/generation/]
+    s5{All uploads OK?}
+    s6[Create _COMMITTED.json if absent<br/>via provider conditional create<br/>sizes + sha256 + generation]
+    s7{Created, or<br/>already exists?}
+    s8[Committed: run retention<br/>delete oldest marker first, then data]
+    s9[Not committed: step N is invisible<br/>orphan generation is GC'd later]
+    s10[Lost the race: another writer<br/>owns step N, GC own generation]
+    s1 --> s2 --> s3
+    s2 --> s4 --> s5
+    s5 -- yes --> s6 --> s7
+    s5 -- no, crash or error --> s9
+    s7 -- created --> s8
+    s7 -- exists --> s10
+  end
+  subgraph RESUME["Restart or resume"]
+    direction TB
+    r1[List steps that have a marker<br/>newest first]
+    r2{Found a step?}
+    r3[Hot tier has a verified copy<br/>of this step on this node?]
+    r4[Use hot copy]
+    r5[Download from the marker's generation<br/>verify size + sha256]
+    r6{Verified?}
+    r7[Load state, continue from step N]
+    r8[Fall back to next older step]
+    r9[Start from step 0]
+    r1 --> r2
+    r2 -- no --> r9
+    r2 -- yes --> r3
+    r3 -- yes --> r4 --> r7
+    r3 -- no --> r5 --> r6
+    r6 -- yes --> r7
+    r6 -- no --> r8 --> r2
+  end
+```
+
 ### 4.3 Platform engineer
 
 1. Apply the Terraform module (or equivalent IaC) to create the account,
@@ -669,6 +715,44 @@ The workspace `phase` becomes `Degraded` only when storage is *configured* and
 not ready. A workspace without storage stays `Ready`, as today, because CPU
 configs never mount `/data`.
 
+The `StorageReady` condition as a state machine. Every `False` state carries a
+reason and a message that names the next action, and none of them changes a
+running pod. Only the transition out of `DriftDetected` needs an operator.
+
+```mermaid
+stateDiagram-v2
+  [*] --> NotConfigured
+  NotConfigured: Unknown / NotConfigured
+  Resolving: Resolving class and identity
+  ClassNotFound: False / ClassNotFound
+  IdentityMissing: False / WorkloadIdentityRequired
+  ClaimNotBound: False / ClaimNotBound
+  Binding: Creating PV and PVC
+  Ready: True / ManagedVolumeBound
+  SharedNode: True / SharedNodeIdentity
+  ExternalReady: True / ExternalClaimBound
+  Drift: False / DriftDetected
+  Deleting: Finalizer running
+
+  NotConfigured --> Resolving: spec.storage set
+  Resolving --> ClassNotFound: class missing or not on allow-list
+  Resolving --> IdentityMissing: Manage, workloadIdentity unset
+  Resolving --> ClaimNotBound: External, claim missing or unbound
+  Resolving --> ExternalReady: External or Adopt, claim Bound
+  Resolving --> Binding: Manage, inputs valid
+  Resolving --> SharedNode: Manage with nodeIdentity
+  ClassNotFound --> Resolving: class added to TauCluster
+  IdentityMissing --> Resolving: workloadIdentity set
+  ClaimNotBound --> Resolving: claim created
+  Binding --> Ready: PVC Bound
+  Ready --> Drift: rendered PV hash differs from live PV
+  Drift --> Resolving: tau workspace storage rebind, no pods use claim
+  Ready --> Deleting: workspace deleted
+  SharedNode --> Deleting: workspace deleted
+  ExternalReady --> Deleting: workspace deleted
+  Deleting --> [*]: Retain keeps bytes, DeleteObjects removes PVC then PV
+```
+
 ---
 
 ## 5. Ownership boundaries
@@ -692,7 +776,7 @@ flowchart TB
   tc --> ctrl
   tw --> ctrl
   ctrl --> k8s
-  ctrl -. status.storage .-> cli
+  ctrl -. "status.storage" .-> cli
   cli -->|"volume tau-data at /data, tau-hot at /mnt"| pod
   pod --> csi --> az
   sdk -->|"commit-marker protocol"| pod
@@ -1006,6 +1090,50 @@ Two deliberate limits:
   and replacing a PV under a running mount is unsafe. The controller sets
   `DriftDetected` and an operator rolls it with `tau workspace storage
   rebind` once no pods use the claim.
+
+### 7.1 End-to-end sequence: first run in a Managed workspace
+
+Who does what, and which step belongs to TauGrid versus the provider. The
+controller touches only Kubernetes objects. Every byte path and every token
+exchange is between the CSI driver and the provider.
+
+```mermaid
+sequenceDiagram
+  autonumber
+  actor PE as Platform engineer
+  actor R as Researcher
+  participant K as Kubernetes API
+  participant C as TauWorkspace controller
+  participant CLI as tau CLI
+  participant D as Provider CSI driver (node)
+  participant S as Provider storage
+
+  PE->>K: Apply TauCluster.spec.storage classes
+  PE->>K: Apply TauWorkspace spec.storage mode Manage
+  K-->>C: Workspace event
+  C->>C: reconcileWorkloadIdentity (clientId)
+  C->>K: Create PV (templated from class) and PVC
+  K-->>C: PVC Bound (static, pre-bound)
+  C->>K: status.storage.claimName, StorageReady=True
+
+  R->>CLI: tau run (no data_pvc in tau.yaml)
+  CLI->>K: Read workspace status.storage
+  CLI->>K: Preflight: CSI driver on selected nodes
+  CLI->>K: Submit Job with PVC at /data
+  K->>D: Pod scheduled, kubelet NodePublishVolume
+  D->>S: Mount with workload identity token
+  alt token accepted
+    S-->>D: Mounted
+    D-->>K: Pod volume ready
+    K-->>CLI: Pods running
+    CLI-->>R: Phase Volume mount: done
+  else rejected or unreachable
+    S-->>D: AuthorizationPermissionMismatch or timeout
+    D-->>K: FailedMount event
+    K-->>CLI: Event on run pods
+    CLI-->>R: Phase Volume mount: warning, hint to check identity or DNS
+  end
+```
 
 ---
 
