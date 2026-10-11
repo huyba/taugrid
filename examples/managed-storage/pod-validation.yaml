@@ -1,0 +1,232 @@
+---
+# Unified Deployment Manifest — Section 4.4 End-to-End Validation Pod
+#
+# This single Pod spec exercises all three storage tiers simultaneously:
+#
+#   init-dataset-imagenet-1k   — HotLoad init container: downloads imagenet to NVMe
+#   init-dataset-laion         — HotLoad init container: downloads laion to NVMe
+#   training                   — Main app container: runs train.py
+#   checkpoint-sidecar         — Sidecar: inotify watcher + async Azure Blob upload
+#
+# Prerequisites:
+#   kubectl apply -f pvc-azure-files-nfs.yaml
+#   kubectl apply -f ../tau-core/config/samples/tau.azure.com_v1alpha1_dataingestion.yaml
+#   kubectl create secret generic azure-blob-creds \
+#       --from-literal=storageAccountKey=<KEY> -n research-team-a
+#
+# The pod_injector webhook injects init/sidecar containers automatically when
+# the tau.azure.com/data-ingestion annotation is present.  This manifest shows
+# the FULLY EXPANDED form (post-injection) for manual validation and CI.
+
+apiVersion: v1
+kind: Pod
+metadata:
+  name: tau-managed-storage-e2e
+  namespace: research-team-a
+  annotations:
+    # Links this pod to the DataIngestion CR — the mutating webhook uses this
+    # annotation to inject init containers + sidecar automatically.
+    tau.azure.com/data-ingestion: vision-llm-run-001
+  labels:
+    app: tau-training
+    tau.azure.com/workload-type: training
+spec:
+  restartPolicy: Never
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # INIT CONTAINERS (run sequentially, must all succeed before app starts)
+  # ────────────────────────────────────────────────────────────────────────────
+  initContainers:
+
+    # Init Container 1: Stream imagenet dataset from Azure Blob → local NVMe
+    - name: init-dataset-imagenet-1k
+      image: ghcr.io/azure/taugrid/tau-init:latest
+      env:
+        - name: STORAGE_ACCOUNT
+          value: "mytaugriddata"
+        - name: CONTAINER
+          value: "training-datasets"
+        - name: BLOB_PREFIX
+          value: "imagenet-1k-tokenized/"
+        - name: DEST_DIR
+          value: "/data/datasets/imagenet"
+        - name: DATASET_NAME
+          value: "imagenet-1k"
+        - name: AZURE_STORAGE_KEY
+          valueFrom:
+            secretKeyRef:
+              name: azure-blob-creds
+              key: storageAccountKey
+      volumeMounts:
+        - name: dataset-imagenet-1k-nvme
+          mountPath: /data/datasets/imagenet
+      resources:
+        requests:
+          cpu: "500m"
+          memory: "512Mi"
+        limits:
+          cpu: "4"
+          memory: "4Gi"
+      terminationMessagePolicy: FallbackToLogsOnError
+
+    # Init Container 2: Stream laion dataset
+    - name: init-dataset-laion
+      image: ghcr.io/azure/taugrid/tau-init:latest
+      env:
+        - name: STORAGE_ACCOUNT
+          value: "mytaugriddata"
+        - name: CONTAINER
+          value: "training-datasets"
+        - name: BLOB_PREFIX
+          value: "laion-aesthetics/v2/"
+        - name: DEST_DIR
+          value: "/data/datasets/laion"
+        - name: DATASET_NAME
+          value: "laion-aesthetics-subset"
+        - name: AZURE_STORAGE_KEY
+          valueFrom:
+            secretKeyRef:
+              name: azure-blob-creds
+              key: storageAccountKey
+      volumeMounts:
+        - name: dataset-laion-nvme
+          mountPath: /data/datasets/laion
+      resources:
+        requests:
+          cpu: "500m"
+          memory: "512Mi"
+        limits:
+          cpu: "4"
+          memory: "4Gi"
+      terminationMessagePolicy: FallbackToLogsOnError
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # CONTAINERS (run concurrently after all initContainers succeed)
+  # ────────────────────────────────────────────────────────────────────────────
+  containers:
+
+    # Main Container: PyTorch training job
+    - name: training
+      image: ghcr.io/azure/taugrid/tau-training-base:latest
+      command: ["python", "/workspace/train.py"]
+      env:
+        - name: DATASET_PATH
+          value: "/data/datasets"
+        - name: CHECKPOINT_DIR
+          value: "/checkpoints"
+        - name: SHARED_DIR
+          value: "/shared"
+        - name: NUM_EPOCHS
+          value: "10"
+        - name: BATCH_SIZE
+          value: "32"
+        - name: RANK
+          value: "0"
+      volumeMounts:
+        # Tier 1: HotLoad datasets (read-only, populated by init containers)
+        - name: dataset-imagenet-1k-nvme
+          mountPath: /data/datasets/imagenet
+          readOnly: true
+        - name: dataset-laion-nvme
+          mountPath: /data/datasets/laion
+          readOnly: true
+        # Tier 2: Checkpoint staging (read-write, drained by sidecar)
+        - name: checkpoint-staging
+          mountPath: /checkpoints
+        # Tier 3: Shared NFS state (read-write, shared across workers)
+        - name: shared-state-nfs
+          mountPath: /shared
+        # Training script
+        - name: training-code
+          mountPath: /workspace
+      resources:
+        requests:
+          cpu: "8"
+          memory: "32Gi"
+          nvidia.com/gpu: "1"
+        limits:
+          cpu: "16"
+          memory: "64Gi"
+          nvidia.com/gpu: "1"
+
+    # Sidecar Container: Checkpoint synchronisation engine (tau-sidecar)
+    # Runs concurrently with training; watches /checkpoints for .done markers.
+    - name: checkpoint-sidecar
+      image: ghcr.io/azure/taugrid/tau-sidecar:latest
+      env:
+        - name: WATCH_DIR
+          value: "/checkpoints"
+        - name: STORAGE_ACCOUNT
+          value: "mytaugriddata"
+        - name: CONTAINER
+          value: "model-checkpoints"
+        - name: BLOB_PREFIX
+          value: "projects/research-team-a/runs/vision-llm-run-001/"
+        - name: MAX_RETRY_ATTEMPTS
+          value: "10"
+        - name: RETENTION_COUNT
+          value: "2"
+        - name: AZURE_STORAGE_KEY
+          valueFrom:
+            secretKeyRef:
+              name: azure-blob-creds
+              key: storageAccountKey
+      volumeMounts:
+        - name: checkpoint-staging
+          mountPath: /checkpoints
+      resources:
+        requests:
+          cpu: "100m"
+          memory: "128Mi"
+        limits:
+          cpu: "500m"
+          memory: "512Mi"
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # VOLUMES
+  # ────────────────────────────────────────────────────────────────────────────
+  volumes:
+    # Tier 1a: NVMe-backed EmptyDir for imagenet dataset
+    # SizeLimit=152Gi = dataset(150Gi) + 2Gi headroom
+    - name: dataset-imagenet-1k-nvme
+      emptyDir:
+        sizeLimit: "152Gi"
+
+    # Tier 1b: NVMe-backed EmptyDir for laion dataset
+    - name: dataset-laion-nvme
+      emptyDir:
+        sizeLimit: "302Gi"
+
+    # Tier 2: Azure Premium SSD PVC for checkpoint staging
+    # Created by DataIngestion controller: vision-llm-run-001-checkpoints
+    - name: checkpoint-staging
+      persistentVolumeClaim:
+        claimName: vision-llm-run-001-checkpoints
+
+    # Tier 3: Azure Files Premium NFS PVC for shared state
+    # Created by DataIngestion controller: vision-llm-run-001-shared-state
+    - name: shared-state-nfs
+      persistentVolumeClaim:
+        claimName: vision-llm-run-001-shared-state
+
+    # Training script ConfigMap (for local testing without a registry)
+    - name: training-code
+      configMap:
+        name: tau-training-script
+
+  # ── Node Affinity ──────────────────────────────────────────────────────────
+  # Route to NVMe-equipped GPU nodes. The DataIngestion controller sets the
+  # nvmeNodeSelector from spec.nvmeNodeSelector.
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: kubernetes.azure.com/agentpool
+                operator: In
+                values:
+                  - gpunvme
+  tolerations:
+    - key: "nvidia.com/gpu"
+      operator: "Exists"
+      effect: "NoSchedule"

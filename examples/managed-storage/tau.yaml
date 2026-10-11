@@ -1,0 +1,71 @@
+# TauGrid Managed Storage Layer — Researcher Configuration
+# Submit with: tau run --config tau.yaml
+#
+# This file is the single source of truth for a training run's storage
+# requirements. The tau CLI translates it into a DataIngestion CR and a
+# TauWorkspace-scoped Job/RayJob, both submitted to Kubernetes together.
+
+apiVersion: tau.azure.com/v1alpha1
+kind: DataIngestion
+metadata:
+  name: vision-llm-run-001
+  namespace: research-team-a
+spec:
+  workspace: research-team-a
+
+  # ── Tier 1: Datasets (Hot-Loaded to Node NVMe) ───────────────────────────
+  # loadStrategy: HotLoad — an init container pre-fetches everything to the
+  # node's local SSD/NVMe before the training pod starts.  The GPU never
+  # waits on Azure Blob HTTP round-trips.
+  #
+  # Fallback (automatic): if total sizeGB of all HotLoad datasets exceeds
+  # nvmeCapacityGiB the controller transparently degrades those datasets to
+  # loadStrategy: StreamMount (BlobFuse2 CSI) without operator intervention.
+  datasets:
+    - name: imagenet-1k
+      loadStrategy: HotLoad
+      sizeGB: 150
+      mountPath: /data/datasets/imagenet
+      source:
+        storageAccount: mytaugriddata
+        container: training-datasets
+        prefix: imagenet-1k-tokenized/
+
+    - name: laion-aesthetics-subset
+      loadStrategy: HotLoad
+      sizeGB: 300
+      mountPath: /data/datasets/laion
+      source:
+        storageAccount: mytaugriddata
+        container: training-datasets
+        prefix: laion-aesthetics/v2/
+
+  nvmeCapacityGiB: 3000
+
+  # ── Tier 2: Asynchronous Checkpoint Synchronisation ───────────────────────
+  # Training writes to localPath (fast local disk).  A sidecar container
+  # detects .done marker files via inotify and asynchronously streams the
+  # corresponding checkpoint to Azure Blob — zero training-loop blocking.
+  #
+  # Failure recovery: exponential backoff (2s→5m) + exclusive lock +
+  # size/hash verification before local eviction (Section 5 design brief).
+  checkpoints:
+    localPath: /checkpoints
+    syncStrategy: Asynchronous
+    retentionCount: 2            # keep 2 latest checkpoints locally
+    uploadRetryMaxAttempts: 10
+    remote:
+      storageAccount: mytaugriddata
+      container: model-checkpoints
+      prefix: projects/research-team-a/runs/vision-llm-run-001/
+
+  # ── Tier 3: Shared State — Azure Files Premium NFS ────────────────────────
+  # ReadWriteMany volume for PyTorch Elastic / Ray distributed coordination.
+  # Backed by Azure Files Premium with NFS 4.1 and:
+  #   nconnect=4 (4 parallel TCP connections per mount)
+  #   rsize=1048576 / wsize=1048576 (1 MiB I/O blocks)
+  sharedState:
+    type: HighThroughputNFS
+    mountPath: /shared
+    storageClassName: azurefile-premium-nfs
+    capacity: "100Gi"

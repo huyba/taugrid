@@ -1,0 +1,68 @@
+---
+# Sample DataIngestion CR — applies all three storage tiers simultaneously.
+# Deploy to the same namespace as your training job.
+apiVersion: tau.azure.com/v1alpha1
+kind: DataIngestion
+metadata:
+  name: llm-training-storage
+  namespace: research-team-a
+spec:
+  workspace: research-team-a
+
+  # ── Tier 1: HotLoad Dataset ───────────────────────────────────────────────
+  # The init container will stream these blobs to node-local NVMe before the
+  # training container boots, eliminating Azure Blob HTTP latency from the
+  # critical training data path.
+  datasets:
+    - name: imagenet-tokens
+      loadStrategy: HotLoad
+      sizeGB: 800
+      mountPath: /data/datasets/imagenet
+      source:
+        storageAccount: mytaugriddata
+        container: datasets
+        prefix: imagenet-tokenized/
+        credentialSecretRef:
+          name: azure-blob-creds
+          key: storageAccountKey
+
+    - name: pile-v2-subset
+      loadStrategy: HotLoad
+      sizeGB: 400
+      mountPath: /data/datasets/pile-v2
+      source:
+        storageAccount: mytaugriddata
+        container: datasets
+        prefix: pile-v2/subset-128k/
+
+  # NVMe capacity hint — if total HotLoad (1200 GiB) exceeds this value the
+  # controller automatically falls back individual datasets to StreamMount.
+  nvmeCapacityGiB: 3000
+  nvmeNodeSelector:
+    kubernetes.azure.com/agentpool: gpunvme
+
+  # ── Tier 2: Asynchronous Checkpoints ─────────────────────────────────────
+  # The sidecar monitors /checkpoints for .done marker files.  When detected
+  # it exclusively locks the corresponding .pt file, streams it to Blob, and
+  # only removes the local copy after a verified size + hash match.
+  checkpoints:
+    localPath: /checkpoints
+    syncStrategy: Asynchronous
+    retentionCount: 2
+    uploadRetryMaxAttempts: 10
+    remote:
+      storageAccount: mytaugriddata
+      container: checkpoints
+      prefix: runs/llm-training-v1/
+      credentialSecretRef:
+        name: azure-blob-creds
+        key: storageAccountKey
+
+  # ── Tier 3: High-Throughput Shared NFS State ──────────────────────────────
+  # ReadWriteMany Azure Files Premium volume for Ray / PyTorch Elastic
+  # distributed coordination metadata. Mounted at /shared on all workers.
+  sharedState:
+    type: HighThroughputNFS
+    mountPath: /shared
+    storageClassName: azurefile-premium-nfs
+    capacity: "100Gi"
