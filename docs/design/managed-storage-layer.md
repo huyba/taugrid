@@ -24,39 +24,7 @@ on AKS with Kueue and KubeRay.
 
 ## 1. Problem Statement & Solution Paradigm
 
-### Solution Paradigm
-
-The Managed Storage Layer decouples infrastructure complexity from the researcher's
-workflow. Instead of manually provisioning storage, writing sidecar containers, and
-configuring Azure Blob uploads, the researcher submits a single `tau.yaml` file:
-
-```
-Researcher writes tau.yaml
-        │
-        ▼ (kubectl apply via tau run)
-DataIngestion CR
-        │
-        ▼
-Tau-Storage-Controller automatically:
-  ├── Provisions the right PVCs (Premium SSD for checkpoints, Azure Files NFS for shared state)
-  ├── Detects NVMe capacity and downgrades HotLoad → StreamMount if needed
-  └── Signals StoragePodInjector to inject init containers + sidecar at admission time
-
-Training Pod gets:
-  ├── /data/datasets/*  — pre-loaded from Azure Blob to local NVMe (zero HTTP during training)
-  ├── /data/checkpoints — async-synced to Azure Blob via inotify sidecar (GPU never waits)
-  └── /data/shared      — RWX NFS mount shared across all distributed workers
-```
-
-The three storage tiers are classified automatically based on access pattern:
-
-| Tier | Access Pattern | Strategy |
-|---|---|---|
-| Datasets | Read-intensive, immutable | `HotLoad` (NVMe cache) or `StreamMount` (BlobFuse2 fallback) |
-| Checkpoints | Write-once, large files | Async inotify sidecar — training writes locally, sidecar uploads in background |
-| Shared State | Concurrent read/write, many workers | Azure Files Premium NFS (RWX, NFS v4.1) |
-
----
+### Problem Statement
 
 The current TauGrid storage implementation relies heavily on static volume mappings
 (`/data/`) backed directly by BlobFuse2 (Azure Blob CSI Driver). This introduces
@@ -90,6 +58,38 @@ Distributed training workers (PyTorch Elastic/Ray) need a unified, low-latency,
 concurrent-write storage layer (ReadWriteMany). Azure Blob Storage lacks microsecond
 synchronization, causing state mismatch, whereas standard block storage cannot be shared
 among hundreds of scattered compute nodes.
+
+### Solution Paradigm
+
+The Managed Storage Layer decouples infrastructure complexity from the researcher's
+workflow. Instead of manually provisioning storage, writing sidecar containers, and
+configuring Azure Blob uploads, the researcher submits a single `tau.yaml` file:
+
+```
+Researcher writes tau.yaml
+        │
+        ▼ (kubectl apply via tau run)
+DataIngestion CR
+        │
+        ▼
+Tau-Storage-Controller automatically:
+  ├── Provisions the right PVCs (Premium SSD for checkpoints, Azure Files NFS for shared state)
+  ├── Detects NVMe capacity and downgrades HotLoad → StreamMount if needed
+  └── Signals StoragePodInjector to inject init containers + sidecar at admission time
+
+Training Pod gets:
+  ├── /data/datasets/*  — pre-loaded from Azure Blob to local NVMe (zero HTTP during training)
+  ├── /data/checkpoints — async-synced to Azure Blob via inotify sidecar (GPU never waits)
+  └── /data/shared      — RWX NFS mount shared across all distributed workers
+```
+
+The three storage tiers are classified automatically based on access pattern:
+
+| Tier | Access Pattern | Strategy |
+|---|---|---|
+| Datasets | Read-intensive, immutable | `HotLoad` (NVMe cache) or `StreamMount` (BlobFuse2 fallback) |
+| Checkpoints | Write-once, large files | Async inotify sidecar — training writes locally, sidecar uploads in background |
+| Shared State | Concurrent read/write, many workers | Azure Files Premium NFS (RWX, NFS v4.1) |
 
 ---
 
