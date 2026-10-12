@@ -1,0 +1,260 @@
+---
+# ── Namespace ──────────────────────────────────────────────────────────────
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: tau-storage-test
+  labels:
+    tau.azure.com/managed-storage: demo
+
+---
+# ── training script ConfigMap ──────────────────────────────────────────────
+# Loaded as a volume mount so we can swap train.py without rebuilding images.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: demo-train-script
+  namespace: tau-storage-test
+data:
+  demo_train.py: |
+    import os, time, hashlib, pathlib, struct, random, logging
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s")
+    log = logging.getLogger("demo")
+    DATASET_PATH   = pathlib.Path(os.getenv("DATASET_PATH",   "/data/datasets"))
+    CHECKPOINT_DIR = pathlib.Path(os.getenv("CHECKPOINT_DIR", "/checkpoints"))
+    SHARED_DIR     = pathlib.Path(os.getenv("SHARED_DIR",     "/shared"))
+    NUM_EPOCHS     = int(os.getenv("NUM_EPOCHS", "5"))
+    CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+    SHARED_DIR.mkdir(parents=True, exist_ok=True)
+    def fake_epoch(epoch):
+        total = sum(random.random() for _ in range(50_000))
+        return 1.0 / (epoch + total * 1e-10)
+    def save_checkpoint(epoch, loss):
+        ckpt = CHECKPOINT_DIR / f"model_epoch_{epoch:03d}.pt"
+        done = pathlib.Path(str(ckpt) + ".done")
+        data = struct.pack(">I", epoch) + bytes(random.getrandbits(8) for _ in range(512*1024))
+        ckpt.write_bytes(data)
+        digest = hashlib.sha256(data).hexdigest()
+        log.info("CHECKPOINT  epoch=%d  size=%d bytes  sha256=%.16s...", epoch, len(data), digest)
+        done.write_bytes(b"")
+        log.info(".done marker written  path=%s", done)
+    def update_shared(epoch, loss):
+        f = SHARED_DIR / f"worker_0_epoch_{epoch:03d}.json"
+        f.write_text(f'{{"epoch":{epoch},"loss":{loss:.6f},"ts":{time.time():.3f}}}\n')
+    files = list(DATASET_PATH.rglob("*")) if DATASET_PATH.exists() else []
+    log.info("Dataset files in %s: %d", DATASET_PATH, len(files))
+    for epoch in range(1, NUM_EPOCHS + 1):
+        t0 = time.perf_counter()
+        loss = fake_epoch(epoch)
+        log.info("TRAIN  epoch=%d/%d  loss=%.4f  elapsed=%.2fs", epoch, NUM_EPOCHS, loss, time.perf_counter()-t0)
+        update_shared(epoch, loss)
+        save_checkpoint(epoch, loss)
+        time.sleep(1)
+    log.info("DONE — all %d epochs complete", NUM_EPOCHS)
+
+---
+# ── Checkpoint Staging PVC (Azure Premium SSD, RWO) ───────────────────────
+# Mirrors what the DataIngestion controller would auto-provision.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: demo-checkpoints
+  namespace: tau-storage-test
+  labels:
+    tau.azure.com/storage-tier: checkpoint
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: managed-csi-premium
+  resources:
+    requests:
+      storage: 5Gi
+
+---
+# ── Shared State PVC (Azure Files Premium, RWX) ───────────────────────────
+# Uses azurefile-csi-premium which supports ReadWriteMany out of the box.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: demo-shared-state
+  namespace: tau-storage-test
+  labels:
+    tau.azure.com/storage-tier: shared-state
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: azurefile-csi-premium
+  resources:
+    requests:
+      storage: 5Gi
+
+---
+# ── Demo DataIngestion CR ──────────────────────────────────────────────────
+# Shows the CRD is installed and accepts the full spec.
+# Status would be populated by the controller (not running in this test).
+apiVersion: tau.azure.com/v1alpha1
+kind: DataIngestion
+metadata:
+  name: demo-storage
+  namespace: tau-storage-test
+spec:
+  workspace: demo-workspace
+  datasets:
+    - name: imagenet-demo
+      loadStrategy: HotLoad
+      sizeGB: 1
+      mountPath: /data/datasets/imagenet
+      source:
+        storageAccount: mytaugriddata
+        container: datasets
+        prefix: imagenet/
+  checkpoints:
+    localPath: /checkpoints
+    syncStrategy: Asynchronous
+    retentionCount: 2
+    uploadRetryMaxAttempts: 5
+    remote:
+      storageAccount: mytaugriddata
+      container: checkpoints
+      prefix: demo/
+  sharedState:
+    type: HighThroughputNFS
+    mountPath: /shared
+    capacity: "5Gi"
+  nvmeCapacityGiB: 100
+
+---
+# ── Demo Pod ───────────────────────────────────────────────────────────────
+# Full 3-tier storage demonstration without GPU or custom Docker images.
+#
+# Containers:
+#   training         — python:3.11-slim running demo_train.py
+#   checkpoint-watch — busybox sidecar monitoring .done markers (mock sidecar)
+#
+# Volumes:
+#   dataset-nvme     — emptyDir (simulates NVMe HotLoad cache)
+#   checkpoints      — managed-csi-premium PVC (RWO, 5Gi)
+#   shared-state     — azurefile-csi-premium PVC (RWX, 5Gi)
+#   training-script  — ConfigMap volume
+apiVersion: v1
+kind: Pod
+metadata:
+  name: tau-storage-demo
+  namespace: tau-storage-test
+  annotations:
+    tau.azure.com/data-ingestion: demo-storage
+  labels:
+    app: tau-storage-demo
+spec:
+  restartPolicy: Never
+
+  # ── Init Container: simulate HotLoad dataset preload ─────────────────────
+  # In production this is tau-init pulling from Azure Blob.
+  # Here we just create synthetic dataset files on the emptyDir.
+  initContainers:
+    - name: init-dataset-imagenet-demo
+      image: busybox:1.36
+      command:
+        - sh
+        - -c
+        - |
+          mkdir -p /data/datasets/imagenet
+          echo "Creating synthetic dataset files..."
+          for i in $(seq 1 10); do
+            dd if=/dev/urandom of=/data/datasets/imagenet/sample_${i}.bin bs=1K count=64 2>/dev/null
+          done
+          echo "Init complete — $(ls /data/datasets/imagenet | wc -l) files created"
+      volumeMounts:
+        - name: dataset-nvme
+          mountPath: /data/datasets/imagenet
+
+  containers:
+    # ── Main: Training container ────────────────────────────────────────────
+    - name: training
+      image: python:3.11-slim
+      command:
+        - python
+        - /workspace/demo_train.py
+      env:
+        - name: DATASET_PATH
+          value: /data/datasets
+        - name: CHECKPOINT_DIR
+          value: /checkpoints
+        - name: SHARED_DIR
+          value: /shared
+        - name: NUM_EPOCHS
+          value: "5"
+      volumeMounts:
+        - name: dataset-nvme
+          mountPath: /data/datasets/imagenet
+          readOnly: true
+        - name: checkpoints
+          mountPath: /checkpoints
+        - name: shared-state
+          mountPath: /shared
+        - name: training-script
+          mountPath: /workspace
+      resources:
+        requests:
+          cpu: "500m"
+          memory: "256Mi"
+        limits:
+          cpu: "1"
+          memory: "512Mi"
+
+    # ── Sidecar: checkpoint monitor (mock of tau-sidecar) ───────────────────
+    # Polls every 2s for .done marker files.  Logs detection + simulates upload.
+    # In production this is tau-sidecar using inotify + Azure Blob SDK.
+    - name: checkpoint-watch
+      image: busybox:1.36
+      command:
+        - sh
+        - -c
+        - |
+          echo "Checkpoint sidecar started — watching /checkpoints for .done markers"
+          UPLOADED=0
+          while true; do
+            for done_file in $(find /checkpoints -name "*.done" 2>/dev/null); do
+              ckpt="${done_file%.done}"
+              if [ -f "$ckpt" ]; then
+                size=$(wc -c < "$ckpt")
+                echo "[SIDECAR] Detected .done: $done_file"
+                echo "[SIDECAR] Checkpoint: $ckpt  size=${size} bytes"
+                echo "[SIDECAR] Simulating Azure Blob upload (mock)..."
+                sleep 0.5
+                echo "[SIDECAR] Upload complete — removing local copy"
+                rm -f "$done_file" "$ckpt"
+                UPLOADED=$((UPLOADED + 1))
+                echo "[SIDECAR] Total uploaded: $UPLOADED"
+              fi
+            done
+            sleep 2
+          done
+      volumeMounts:
+        - name: checkpoints
+          mountPath: /checkpoints
+      resources:
+        requests:
+          cpu: "50m"
+          memory: "32Mi"
+        limits:
+          cpu: "100m"
+          memory: "64Mi"
+
+  volumes:
+    # Tier 1: emptyDir simulating NVMe HotLoad cache
+    - name: dataset-nvme
+      emptyDir:
+        sizeLimit: "2Gi"
+    # Tier 2: Azure Premium SSD — checkpoint staging
+    - name: checkpoints
+      persistentVolumeClaim:
+        claimName: demo-checkpoints
+    # Tier 3: Azure Files Premium — shared NFS state
+    - name: shared-state
+      persistentVolumeClaim:
+        claimName: demo-shared-state
+    # Training script from ConfigMap
+    - name: training-script
+      configMap:
+        name: demo-train-script
