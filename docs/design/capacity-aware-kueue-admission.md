@@ -422,18 +422,23 @@ kubectl get cluster -o jsonpath='{.status.conditions[?(@.type=="ProvisioningRead
 
 ## Worked Example
 
-A concrete end-to-end runbook using the `helmdeep-aks` AKS cluster is in
+**Not yet demonstrated end to end.** A partial run on the `helmdeep-aks` AKS
+cluster (2026-10-12, upstream Kueue v0.20.1) is logged in
 [`docs/design/examples/cpu-demo/README.md`](examples/cpu-demo/README.md).
+No ProvisioningRequest was created and no timings were measured.
 
-It uses the `check-capacity` provisioning class on a single CPU node to demonstrate
-the full ProvisioningRequest → AdmissionCheck → Workload admission flow without
-requiring GPU nodes. The Kueue code path is identical to the GPU production path.
+What the run established:
 
-**Key results recorded from the run:**
-- ProvisioningRequest created by Kueue within **~2s** of job submission
-- `check-capacity` resolves `Provisioned: True` within **~18s**
-- Kueue sets `suspend: false` → pod reaches `Running` in **~20s** total
-- Full end-to-end with 500m CPU workload on `Standard_B2pls_v2` (1 node)
+- AKS does not install the `ProvisioningRequest` CRD. Without it Kueue logs
+  `Skipping provisioning controller setup: Provisioning Requests not supported`
+  and the AdmissionCheck can never become Active.
+- Whether the AKS managed Cluster Autoscaler answers ProvisioningRequests is
+  unverified. This is the main open risk for the design.
+- Kueue v0.20.1 serves only `kueue.x-k8s.io/v1beta2`. The `v1beta1` manifests
+  and GVK in this branch are rejected there (not checked on the pinned v0.19.2).
+- `spec.retryDelayMinutes` is not a field of `v1beta2` `AdmissionCheck`; the
+  chart template is rejected by the API server. Retry settings belong in
+  `ProvisioningRequestConfig.spec.retryStrategy`.
 
 ---
 
