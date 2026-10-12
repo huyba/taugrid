@@ -7,7 +7,7 @@ import "k8s.io/apimachinery/pkg/runtime"
 
 func init() {
 	SchemeBuilder.Register(func(scheme *runtime.Scheme) error {
-		scheme.AddKnownTypes(GroupVersion, &DataIngestion{}, &DataIngestionList{})
+		scheme.AddKnownTypes(GroupVersion, &DataFetch{}, &DataFetchList{})
 		return nil
 	})
 }

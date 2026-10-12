@@ -8,7 +8,7 @@ import (
 )
 
 const (
-	KindDataIngestion = "DataIngestion"
+	KindDataFetch = "DataFetch"
 
 	// LoadStrategy values
 	LoadStrategyHotLoad     = "HotLoad"
@@ -20,13 +20,13 @@ const (
 	// SharedState type values
 	SharedStateTypeHighThroughputNFS = "HighThroughputNFS"
 
-	// DataIngestion phase values
-	DataIngestionPhasePending      = "Pending"
-	DataIngestionPhaseProvisioning = "Provisioning"
-	DataIngestionPhaseReady        = "Ready"
-	DataIngestionPhaseDegraded     = "Degraded"
+	// DataFetch phase values
+	DataFetchPhasePending      = "Pending"
+	DataFetchPhaseProvisioning = "Provisioning"
+	DataFetchPhaseReady        = "Ready"
+	DataFetchPhaseDegraded     = "Degraded"
 
-	// Condition type keys specific to DataIngestion
+	// Condition type keys specific to DataFetch
 	ConditionDatasetsReady    = "DatasetsReady"
 	ConditionCheckpointsReady = "CheckpointsReady"
 	ConditionSharedStateReady = "SharedStateReady"
@@ -61,7 +61,7 @@ type SecretKeyRef struct {
 
 // DatasetSpec describes a training dataset to be made available to training pods.
 type DatasetSpec struct {
-	// Name is the unique identifier for this dataset within the DataIngestion.
+	// Name is the unique identifier for this dataset within the DataFetch.
 	// +kubebuilder:validation:MinLength=1
 	Name string `json:"name"`
 
@@ -144,9 +144,9 @@ type SharedStateSpec struct {
 	Capacity string `json:"capacity,omitempty"`
 }
 
-// DataIngestionSpec is the desired state of a DataIngestion resource.
-type DataIngestionSpec struct {
-	// Workspace is the name of the TauWorkspace this DataIngestion is scoped to.
+// DataFetchSpec is the desired state of a DataFetch resource.
+type DataFetchSpec struct {
+	// Workspace is the name of the TauWorkspace this DataFetch is scoped to.
 	// +kubebuilder:validation:MinLength=1
 	Workspace string `json:"workspace"`
 
@@ -174,8 +174,8 @@ type DataIngestionSpec struct {
 	NVMeCapacityGiB int64 `json:"nvmeCapacityGiB,omitempty"`
 }
 
-// DataIngestionDatasetStatus captures the per-dataset provisioning outcome.
-type DataIngestionDatasetStatus struct {
+// DataFetchDatasetStatus captures the per-dataset provisioning outcome.
+type DataFetchDatasetStatus struct {
 	// Name matches DatasetSpec.Name.
 	Name string `json:"name"`
 	// Phase is Provisioning or Ready.
@@ -189,15 +189,15 @@ type DataIngestionDatasetStatus struct {
 	Message string `json:"message,omitempty"`
 }
 
-// DataIngestionStatus is the observed state of a DataIngestion resource.
-type DataIngestionStatus struct {
+// DataFetchStatus is the observed state of a DataFetch resource.
+type DataFetchStatus struct {
 	// +kubebuilder:validation:Enum=Pending;Provisioning;Ready;Degraded
 	Phase string `json:"phase,omitempty"`
 
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 
 	// Datasets contains per-dataset status after the last reconcile.
-	Datasets []DataIngestionDatasetStatus `json:"datasets,omitempty"`
+	Datasets []DataFetchDatasetStatus `json:"datasets,omitempty"`
 
 	// SharedStatePVCName is the name of the Azure Files NFS PVC provisioned for
 	// shared state, when spec.sharedState is set.
@@ -214,21 +214,21 @@ type DataIngestionStatus struct {
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
-// +kubebuilder:resource:path=dataingestions,singular=dataingestion,scope=Namespaced,shortName=di
+// +kubebuilder:resource:path=datafetches,singular=datafetch,scope=Namespaced,shortName=di
 // +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
 // +kubebuilder:printcolumn:name="Workspace",type=string,JSONPath=`.spec.workspace`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
-type DataIngestion struct {
+type DataFetch struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`
 
-	Spec   DataIngestionSpec   `json:"spec,omitempty"`
-	Status DataIngestionStatus `json:"status,omitempty"`
+	Spec   DataFetchSpec   `json:"spec,omitempty"`
+	Status DataFetchStatus `json:"status,omitempty"`
 }
 
 // +kubebuilder:object:root=true
-type DataIngestionList struct {
+type DataFetchList struct {
 	metav1.TypeMeta `json:",inline"`
 	metav1.ListMeta `json:"metadata,omitempty"`
-	Items           []DataIngestion `json:"items"`
+	Items           []DataFetch `json:"items"`
 }

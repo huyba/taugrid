@@ -6,7 +6,7 @@
 // node-local NVMe-backed emptyDir volume before the training container starts.
 //
 // Section 2 – Pod Initialization Phase:
-//  1. Init container boots, reads DataIngestion metadata from env vars.
+//  1. Init container boots, reads DataFetch metadata from env vars.
 //  2. Streams dataset via multi-threaded download from Azure Blob → local NVMe.
 //  3. Computes SHA-256 checksum per file → verified → init exits (code 0).
 //  4. Main training container boots with data already on local disk.

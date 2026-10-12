@@ -10,12 +10,12 @@
 #
 # Prerequisites:
 #   kubectl apply -f pvc-azure-files-nfs.yaml
-#   kubectl apply -f ../tau-core/config/samples/tau.azure.com_v1alpha1_dataingestion.yaml
+#   kubectl apply -f ../tau-core/config/samples/tau.azure.com_v1alpha1_datafetch.yaml
 #   kubectl create secret generic azure-blob-creds \
 #       --from-literal=storageAccountKey=<KEY> -n research-team-a
 #
 # The pod_injector webhook injects init/sidecar containers automatically when
-# the tau.azure.com/data-ingestion annotation is present.  This manifest shows
+# the tau.azure.com/data-fetch annotation is present.  This manifest shows
 # the FULLY EXPANDED form (post-injection) for manual validation and CI.
 
 apiVersion: v1
@@ -24,9 +24,9 @@ metadata:
   name: tau-managed-storage-e2e
   namespace: research-team-a
   annotations:
-    # Links this pod to the DataIngestion CR — the mutating webhook uses this
+    # Links this pod to the DataFetch CR — the mutating webhook uses this
     # annotation to inject init containers + sidecar automatically.
-    tau.azure.com/data-ingestion: vision-llm-run-001
+    tau.azure.com/data-fetch: vision-llm-run-001
   labels:
     app: tau-training
     tau.azure.com/workload-type: training
@@ -198,13 +198,13 @@ spec:
         sizeLimit: "302Gi"
 
     # Tier 2: Azure Premium SSD PVC for checkpoint staging
-    # Created by DataIngestion controller: vision-llm-run-001-checkpoints
+    # Created by DataFetch controller: vision-llm-run-001-checkpoints
     - name: checkpoint-staging
       persistentVolumeClaim:
         claimName: vision-llm-run-001-checkpoints
 
     # Tier 3: Azure Files Premium NFS PVC for shared state
-    # Created by DataIngestion controller: vision-llm-run-001-shared-state
+    # Created by DataFetch controller: vision-llm-run-001-shared-state
     - name: shared-state-nfs
       persistentVolumeClaim:
         claimName: vision-llm-run-001-shared-state
@@ -215,7 +215,7 @@ spec:
         name: tau-training-script
 
   # ── Node Affinity ──────────────────────────────────────────────────────────
-  # Route to NVMe-equipped GPU nodes. The DataIngestion controller sets the
+  # Route to NVMe-equipped GPU nodes. The DataFetch controller sets the
   # nvmeNodeSelector from spec.nvmeNodeSelector.
   affinity:
     nodeAffinity:

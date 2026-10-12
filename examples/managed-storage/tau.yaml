@@ -2,11 +2,11 @@
 # Submit with: tau run --config tau.yaml
 #
 # This file is the single source of truth for a training run's storage
-# requirements. The tau CLI translates it into a DataIngestion CR and a
+# requirements. The tau CLI translates it into a DataFetch CR and a
 # TauWorkspace-scoped Job/RayJob, both submitted to Kubernetes together.
 
 apiVersion: tau.azure.com/v1alpha1
-kind: DataIngestion
+kind: DataFetch
 metadata:
   name: vision-llm-run-001
   namespace: research-team-a

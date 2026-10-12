@@ -54,7 +54,7 @@ Design a **Managed Storage Layer** driven by a custom Kubernetes Controller writ
 │                   etcd                              │
 └──────────────────┬──────────────────────────────────┘
                    │
-                   │ (Watch Event: DataIngestion CRD / TauWorkspace)
+                   │ (Watch Event: DataFetch CRD / TauWorkspace)
                    ▼
 ┌─────────────────────────────────────────────────────┐
 │          Tau-Storage-Controller (Go)                │
@@ -78,7 +78,7 @@ Design a **Managed Storage Layer** driven by a custom Kubernetes Controller writ
 ```
 [ Pod Initialization Phase ]
 1. Kubelet schedules Pod ──> Init Container (Go/AzCopy Binary) boots up.
-2. Init Container reads DataIngestion CRD Metadata.
+2. Init Container reads DataFetch CRD Metadata.
 3. Init Container streams Dataset via multi-threaded download from Azure Blob
    to Node Local NVMe (mapped inside Pod via high-speed hostPath/emptyDir).
 4. Init Container computes SHA256 checksum ──> Validated ──> Init Exits.
@@ -112,20 +112,20 @@ Design a **Managed Storage Layer** driven by a custom Kubernetes Controller writ
 
 ### Task 4.1: CRD Design & YAML Specifications
 
-#### 4.1.1 DataIngestion Custom Resource Definition (CRD)
+#### 4.1.1 DataFetch Custom Resource Definition (CRD)
 
 ```yaml
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
-  name: dataingestions.tau.azure.com
+  name: datafetches.tau.azure.com
 spec:
   group: tau.azure.com
   names:
-    kind: DataIngestion
-    listKind: DataIngestionList
-    plural: dataingestions
-    singular: dataingestion
+    kind: DataFetch
+    listKind: DataFetchList
+    plural: datafetches
+    singular: datafetch
     shortNames: [di]
   scope: Namespaced
   versions:
@@ -289,14 +289,14 @@ import (
     taustorv1alpha1 "github.com/azure/taugrid/controllers/tau-core/api/v1alpha1"
 )
 
-type DataIngestionReconciler struct {
+type DataFetchReconciler struct {
     client.Client
 }
 
-func (r *DataIngestionReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *DataFetchReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
     log := ctrl.LoggerFrom(ctx)
 
-    var di taustorv1alpha1.DataIngestion
+    var di taustorv1alpha1.DataFetch
     if err := r.Get(ctx, req.NamespacedName, &di); err != nil {
         return ctrl.Result{}, client.IgnoreNotFound(err)
     }
@@ -325,11 +325,11 @@ func (r *DataIngestionReconciler) Reconcile(ctx context.Context, req ctrl.Reques
         return ctrl.Result{}, err
     }
 
-    log.Info("DataIngestion reconciled", "name", di.Name, "phase", di.Status.Phase)
+    log.Info("DataFetch reconciled", "name", di.Name, "phase", di.Status.Phase)
     return ctrl.Result{}, nil
 }
 
-func (r *DataIngestionReconciler) reconcileDatasets(ctx context.Context, di *taustorv1alpha1.DataIngestion) error {
+func (r *DataFetchReconciler) reconcileDatasets(ctx context.Context, di *taustorv1alpha1.DataFetch) error {
     capacity := di.Spec.NVMeCapacityGiB
     if capacity == 0 {
         capacity = 3000
@@ -387,12 +387,12 @@ func (h *StoragePodInjector) Handle(ctx context.Context, req admission.Request) 
         return admission.Errored(400, err)
     }
 
-    diName, ok := pod.Annotations["tau.azure.com/data-ingestion"]
+    diName, ok := pod.Annotations["tau.azure.com/data-fetch"]
     if !ok {
-        return admission.Allowed("no data-ingestion annotation")
+        return admission.Allowed("no data-fetch annotation")
     }
 
-    var di taustorv1alpha1.DataIngestion
+    var di taustorv1alpha1.DataFetch
     if err := h.Client.Get(ctx, client.ObjectKey{Name: diName, Namespace: req.Namespace}, &di); err != nil {
         return admission.Errored(500, err)
     }
@@ -406,7 +406,7 @@ func (h *StoragePodInjector) Handle(ctx context.Context, req admission.Request) 
     return admission.PatchResponseFromRaw(req.Object.Raw, patched)
 }
 
-func InjectStorageContainers(pod *corev1.Pod, di *taustorv1alpha1.DataIngestion) {
+func InjectStorageContainers(pod *corev1.Pod, di *taustorv1alpha1.DataFetch) {
     for i, ds := range di.Spec.Datasets {
         effectiveLoad := di.Status.Datasets[i].EffectiveLoad
         if effectiveLoad == "" {
@@ -684,7 +684,7 @@ metadata:
   name: tau-training-validation
   namespace: tau-storage-test
   annotations:
-    tau.azure.com/data-ingestion: my-training-run  # triggers webhook injection
+    tau.azure.com/data-fetch: my-training-run  # triggers webhook injection
 spec:
   restartPolicy: Never
 
@@ -869,8 +869,8 @@ No researcher action required. The downgrade is logged in `kubectl get di -o wid
 
 | Component | File | Status |
 |---|---|---|
-| DataIngestion CRD types | `controllers/tau-core/api/v1alpha1/storage_types.go` | ✅ Implemented |
-| CRD YAML manifest | `controllers/tau-core/config/crd/bases/tau.azure.com_dataingestions.yaml` | ✅ Implemented |
+| DataFetch CRD types | `controllers/tau-core/api/v1alpha1/storage_types.go` | ✅ Implemented |
+| CRD YAML manifest | `controllers/tau-core/config/crd/bases/tau.azure.com_datafetches.yaml` | ✅ Implemented |
 | Storage controller | `controllers/tau-core/internal/controller/storage_controller.go` | ✅ Implemented |
 | Pod injector webhook | `controllers/tau-core/internal/controller/pod_injector.go` | ✅ Implemented |
 | tau-sidecar (inotify engine) | `controllers/tau-sidecar/cmd/sidecar/main.go` | ✅ Implemented |

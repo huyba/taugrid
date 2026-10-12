@@ -54,7 +54,7 @@ data:
 
 ---
 # ── Checkpoint Staging PVC (Azure Premium SSD, RWO) ───────────────────────
-# Mirrors what the DataIngestion controller would auto-provision.
+# Mirrors what the DataFetch controller would auto-provision.
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -89,11 +89,11 @@ spec:
       storage: 5Gi
 
 ---
-# ── Demo DataIngestion CR ──────────────────────────────────────────────────
+# ── Demo DataFetch CR ──────────────────────────────────────────────────
 # Shows the CRD is installed and accepts the full spec.
 # Status would be populated by the controller (not running in this test).
 apiVersion: tau.azure.com/v1alpha1
-kind: DataIngestion
+kind: DataFetch
 metadata:
   name: demo-storage
   namespace: tau-storage-test
@@ -142,7 +142,7 @@ metadata:
   name: tau-storage-demo
   namespace: tau-storage-test
   annotations:
-    tau.azure.com/data-ingestion: demo-storage
+    tau.azure.com/data-fetch: demo-storage
   labels:
     app: tau-storage-demo
 spec:
