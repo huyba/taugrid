@@ -101,7 +101,7 @@ AI_RUNTIME_E2E=0 go test -count=1 ./...
 | `scheduler/` | 2 | Kubernetes scheduler honors Tau's GPU bin-packing preferred pod affinity and packs single-device plus 2-4 GPU same-node pods onto already-occupied nodes |
 | `stack/` | 7 | Full-stack Kueue → KubeRay → Ray Data **inference** pipeline, GPU variants, **training** SGD loop, Tau Python SDK CPU/GPU entrypoint submit tests, and manual 16-GPU Ray Train nanoGPT conformance |
 | `multisite/` | 1 | Two independently queued GPU Jobs are Running concurrently on Nodes carrying two distinct authoritative `tau.azure.com/site` labels |
-| `provisioning/` | 8 | Capacity-aware admission: success, timeout, cancellation and cleanup, each on a quota-only queue and on a ProvisioningRequest-gated queue |
+| `provisioning/` | 10 | Capacity-aware admission: success, timeout, cancellation and cleanup, each on a quota-only queue and on a ProvisioningRequest-gated queue |
 
 The Tau Python SDK entrypoint smoke submits a CPU RayJob through
 `tau.train(entrypoint=...)` and verifies a staged pure-Python/PyTorch-shaped
@@ -146,6 +146,17 @@ gated by a ProvisioningRequest AdmissionCheck (`TestAfter*`).
 | Timeout | 600 CPU (fits no node) | Before: job resumed, pod `Unschedulable`. After: job stays suspended, no pod, request reports `CapacityIsNotFound`. Both: quota stays reserved and a second job is starved until the stuck job is deleted |
 | Cancellation | 600 CPU, deleted while waiting | Workload, pods and ProvisioningRequest are gone and the queue is idle |
 | Cleanup | 500m CPU, `sleep 5` | After the Job finishes the queue is idle and the ProvisioningRequest is removed |
+
+Two more tests cover how a gated queue gets its quota back:
+
+- `TestAfterFailedReleasesQuota` writes `Failed=True` on the ProvisioningRequest
+  and expects Kueue to hand the quota to the starved job.
+- `TestAfterTimeoutReleasesQuota` expects tau-core-controller's
+  `--provisioning-timeout` to deactivate the stuck workload. It runs only when
+  `E2E_PROVISIONING_TIMEOUT=<that duration>` is set, and `TestAfterTimeout` is
+  skipped in that case. Where the controller is not deployed,
+  `TestProvisioningTimeoutLive` in `controllers/tau-core/internal/controller`
+  runs just that reconciler against the current kubeconfig.
 
 Requirements, in addition to Kueue:
 

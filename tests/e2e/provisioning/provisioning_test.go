@@ -18,6 +18,15 @@
 //   - Cancellation: the Job is deleted while it waits for capacity.
 //   - Cleanup: the Job finishes; nothing it reserved is left behind.
 //
+// Two further tests cover how a gated queue gets its quota back when capacity
+// does not arrive:
+//
+//   - TestAfterFailedReleasesQuota: the autoscaler reports the request as
+//     Failed (simulated by writing the condition) and Kueue releases the quota.
+//   - TestAfterTimeoutReleasesQuota: the autoscaler never answers, and
+//     tau-core-controller's --provisioning-timeout deactivates the workload.
+//     Needs that controller running; set E2E_PROVISIONING_TIMEOUT to its value.
+//
 // The tests need the ProvisioningRequest CRD, a Cluster Autoscaler that
 // processes it, and an autoscaled node pool, so the package is gated behind
 // E2E_PROVISIONING=1 in addition to AI_RUNTIME_E2E=1.
@@ -111,14 +120,46 @@ func runTests(m *testing.M) int {
 
 // --- Tests ---
 
-func TestBeforeSuccess(t *testing.T)      { successScenario(newContext(t), before) }
-func TestAfterSuccess(t *testing.T)       { successScenario(newContext(t), after) }
-func TestBeforeTimeout(t *testing.T)      { timeoutScenario(newContext(t), before) }
-func TestAfterTimeout(t *testing.T)       { timeoutScenario(newContext(t), after) }
+func TestBeforeSuccess(t *testing.T) { successScenario(newContext(t), before) }
+func TestAfterSuccess(t *testing.T)  { successScenario(newContext(t), after) }
+func TestBeforeTimeout(t *testing.T) { timeoutScenario(newContext(t), before) }
+func TestAfterTimeout(t *testing.T) {
+	tc := newContext(t)
+	if controllerTimeout(t) > 0 {
+		t.Skip("Skipping: the provisioning timeout controller is running, so the workload does not stay stuck; see TestAfterTimeoutReleasesQuota")
+	}
+	timeoutScenario(tc, after)
+}
 func TestBeforeCancellation(t *testing.T) { cancellationScenario(newContext(t), before) }
 func TestAfterCancellation(t *testing.T)  { cancellationScenario(newContext(t), after) }
 func TestBeforeCleanup(t *testing.T)      { cleanupScenario(newContext(t), before) }
 func TestAfterCleanup(t *testing.T)       { cleanupScenario(newContext(t), after) }
+
+func TestAfterFailedReleasesQuota(t *testing.T) { failedScenario(newContext(t)) }
+
+func TestAfterTimeoutReleasesQuota(t *testing.T) {
+	tc := newContext(t)
+	timeout := controllerTimeout(t)
+	if timeout == 0 {
+		t.Skip("Skipping: set E2E_PROVISIONING_TIMEOUT to the controller's --provisioning-timeout to run")
+	}
+	timeoutReleaseScenario(tc, timeout)
+}
+
+// controllerTimeout is the --provisioning-timeout the tau-core-controller under
+// test runs with, or 0 when that controller is not running.
+func controllerTimeout(t *testing.T) time.Duration {
+	t.Helper()
+	raw := os.Getenv("E2E_PROVISIONING_TIMEOUT")
+	if raw == "" {
+		return 0
+	}
+	timeout, err := time.ParseDuration(raw)
+	if err != nil || timeout <= 0 {
+		t.Fatalf("E2E_PROVISIONING_TIMEOUT=%q is not a positive duration", raw)
+	}
+	return timeout
+}
 
 func newContext(t *testing.T) *e2e.TestContext {
 	t.Helper()
@@ -202,6 +243,75 @@ func timeoutScenario(tc *e2e.TestContext, m mode) {
 	// Deleting the stuck job is what frees the quota.
 	deleteJob(tc, m, "too-big")
 	waitForWorkloadCondition(tc, m, "starved", "QuotaReserved", "True", time.Minute)
+}
+
+// failedScenario: the autoscaler gives up on the request.
+//
+// The AKS autoscaler was never seen to do this by itself, so the test writes
+// the Failed condition the way the autoscaler would. Kueue must then take the
+// quota back from the workload so the starved job can have it.
+func failedScenario(tc *e2e.TestContext) {
+	m := after
+	registerDiagnostics(tc, m)
+	stuck, _ := submitStuckAndStarved(tc, m)
+
+	request := waitForRequestCondition(tc, m, stuck.GetName(), "Provisioned", "False", 2*time.Minute)
+	conditions, _, _ := unstructured.NestedSlice(request.Object, "status", "conditions")
+	conditions = append(conditions, map[string]interface{}{
+		"type":               "Failed",
+		"status":             "True",
+		"reason":             "SimulatedByTest",
+		"message":            "e2e test marked the request as failed",
+		"lastTransitionTime": time.Now().UTC().Format(time.RFC3339),
+		"observedGeneration": request.GetGeneration(),
+	})
+	require.NoError(tc, unstructured.SetNestedSlice(request.Object, conditions, "status", "conditions"))
+	_, err := tc.DynamicClient().Resource(provisioningRequestGVR).Namespace(m.namespace).UpdateStatus(tc.Ctx(), request, metav1.UpdateOptions{})
+	require.NoError(tc, err)
+
+	waitForWorkloadCondition(tc, m, "starved", "QuotaReserved", "True", 2*time.Minute)
+	assert.True(tc, jobSuspended(tc, m, "too-big"), "failed job must stay suspended")
+	assert.Empty(tc, jobPods(tc, m, "too-big"), "failed job must never get a pod")
+}
+
+// timeoutReleaseScenario: the autoscaler never answers, and the provisioning
+// timeout controller deactivates the workload so its quota is released.
+func timeoutReleaseScenario(tc *e2e.TestContext, timeout time.Duration) {
+	m := after
+	registerDiagnostics(tc, m)
+	stuck, _ := submitStuckAndStarved(tc, m)
+
+	poll(tc, timeout+90*time.Second, "the stuck workload to be deactivated", func() (bool, string) {
+		workload, err := workloadForJob(tc, m, "too-big")
+		if err != nil {
+			return false, err.Error()
+		}
+		active, found, _ := unstructured.NestedBool(workload.Object, "spec", "active")
+		return found && !active, fmt.Sprintf("spec.active=%t (set=%t)", active, found)
+	})
+
+	waitForWorkloadCondition(tc, m, "too-big", "QuotaReserved", "False", time.Minute)
+	waitForNoRequests(tc, m, stuck.GetName(), time.Minute)
+	assert.True(tc, jobSuspended(tc, m, "too-big"), "timed-out job must stay suspended")
+	assert.Empty(tc, jobPods(tc, m, "too-big"), "timed-out job must never get a pod")
+	waitForWorkloadCondition(tc, m, "starved", "QuotaReserved", "True", time.Minute)
+
+	events, err := tc.KubeClient().CoreV1().Events(m.namespace).List(tc.Ctx(), metav1.ListOptions{
+		FieldSelector: "reason=ProvisioningTimeout,involvedObject.name=" + stuck.GetName(),
+	})
+	require.NoError(tc, err)
+	assert.NotEmpty(tc, events.Items, "the controller should record why it deactivated the workload")
+}
+
+// submitStuckAndStarved submits a job whose capacity never arrives and waits
+// for it to hold the quota, then a second job that is starved by it.
+func submitStuckAndStarved(tc *e2e.TestContext, m mode) (stuck, starved *unstructured.Unstructured) {
+	tc.Helper()
+	submitJob(tc, m, "too-big", tooBigCPU, "sleep infinity")
+	stuck = waitForWorkloadCondition(tc, m, "too-big", "QuotaReserved", "True", time.Minute)
+	submitJob(tc, m, "starved", tooBigCPU, "sleep infinity")
+	starved = waitForWorkloadCondition(tc, m, "starved", "QuotaReserved", "False", time.Minute)
+	return stuck, starved
 }
 
 // cancellationScenario: the Job is deleted while it waits for capacity.

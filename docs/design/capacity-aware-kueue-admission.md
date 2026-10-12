@@ -59,12 +59,43 @@ node level.
 └──────────────────────────────────────────────────────────────────┘
 ```
 
+## Provisioning Timeout
+
+Kueue reserves quota before it asks Cluster Autoscaler for capacity, and has no
+deadline for the answer. On AKS the autoscaler does not fail a request it cannot
+satisfy, so without a deadline the quota is held indefinitely.
+
+`ProvisioningTimeoutReconciler` in tau-core-controller supplies the deadline. It
+watches Kueue Workloads and acts on one only when all of these hold:
+
+- `spec.active` is not `false`
+- `QuotaReserved=True`, and neither `Admitted` nor `Finished` is true
+- an admission check whose AdmissionCheck has
+  `controllerName: kueue.x-k8s.io/provisioning-request` is in state `Pending`
+- the `QuotaReserved` condition is older than the timeout
+
+It then sets `spec.active=false` and records a `ProvisioningTimeout` warning
+event on the Workload. Kueue does the rest: evicts the Workload, deletes its
+ProvisioningRequest and releases the quota. No pod was ever created.
+
+The timeout is off by default. Enable it with the controller flag
+`--provisioning-timeout=<duration>`, or in Helm:
+
+```yaml
+tau-core-controller:
+  provisioningTimeout: 30m
+```
+
+This is the one place TauGrid writes to a Kueue Workload for this feature. It
+still does not create or modify ProvisioningRequests (decision D1).
+
 ## Component Ownership
 
 | Component | Responsibility |
 |-----------|----------------|
 | TauGrid CLI | Renders `suspend: true` workloads with ClusterQueue label |
 | TauCluster controller | Observes ProvisioningReady condition; does **not** reconcile ProvisioningRequests |
+| Provisioning timeout controller | Optional. Deactivates a Workload that has held quota past the timeout while its provisioning check is `Pending` |
 | Kueue | Reserves quota, creates ProvisioningRequest, sets `suspend: false` on success, releases quota on failure |
 | Cluster Autoscaler | Watches ProvisioningRequest CRD; triggers VMSS scale-up; sets `Provisioned: True` or `Failed` |
 | Platform engineer | Enables autoscaling on GPU node pool; installs Helm opt-in objects; applies ClusterQueue patch |
@@ -374,8 +405,8 @@ that has not been tested.
 
 | Scenario | Trigger | Resolution |
 |----------|---------|------------|
-| Capacity not available (observed on AKS) | CA sets `Provisioned=False` / `CapacityIsNotFound` and keeps retrying; it does not set `Failed` | AdmissionCheck stays `Pending`; Job stays suspended with no pod; **quota stays reserved** and later jobs can starve. No change in a 21-minute watch. Recovery today is deleting the job |
-| Capacity request failed (not observed) | CA sets `Failed=True` | Kueue retries per `retryStrategy`, then rejects the check and releases quota |
+| Capacity not available (observed on AKS) | CA sets `Provisioned=False` / `CapacityIsNotFound` and keeps retrying; it does not set `Failed`. No change in a 21-minute watch | Without the timeout: check stays `Pending`, quota stays reserved, later jobs starve. With `--provisioning-timeout` (observed): the controller deactivates the Workload once it has held quota that long; Kueue evicts it, deletes the ProvisioningRequest and releases the quota. The Job stays suspended and is not retried |
+| Capacity request failed (observed, failure simulated) | CA sets `Failed=True` | Check goes to `Retry`; quota is released after the retry backoff (60s by default) and the workload is requeued, up to `retryLimit` times before the check is rejected |
 | Booking expiry | `ValidUntilSeconds` elapsed, `Provisioned: True` not set | Same as Failed; Kueue retries up to `retryLimit` |
 | Partial scale-up (atomic violation) | Cloud provisions M < N requested nodes | `best-effort-atomic-scale-up` rejects; atomic cancel; quota released |
 | ImagePullBackOff / CrashLoopBackOff | Nodes provisioned but runtime fails | TauGrid retry policy; on max retries Workload deleted → OwnerRef GC → CA scale-down |
@@ -467,12 +498,16 @@ What the run established:
   ClusterQueue overlay and the observer GVK were moved to `v1beta2`, with retry
   settings in `ProvisioningRequestConfig.spec.retryStrategy`.
 - When capacity cannot be found, the AKS autoscaler does not fail the request.
-  The quota stays reserved and later jobs starve, as in quota-only mode. The
-  gate keeps the Job suspended and podless, but does not release the quota.
+  Without a timeout the quota stays reserved and later jobs starve, as in
+  quota-only mode. With `--provisioning-timeout` set to 45s, the stuck workload
+  was deactivated 45 seconds after reserving quota and the starved job got it.
+- When a request is marked `Failed`, Kueue released the quota after its 60s
+  retry backoff. The failure was simulated; AKS never produced one.
 
 Not covered: GPU pools, multi-node atomicity, autoscaler-reported failures and
 retries, cancellation during an in-flight scale-up, the pinned Kueue v0.19.2
-build, and the TauGrid chart, CLI and `ProvisioningReady` observer.
+build, the timeout inside a deployed controller image, and the TauGrid chart,
+CLI and `ProvisioningReady` observer.
 
 ---
 
@@ -484,7 +519,9 @@ build, and the TauGrid chart, CLI and `ProvisioningReady` observer.
 - [ ] Add unit tests in `provisioning_ready_test.go`
 - [x] Add example `cluster-overlays/` ClusterQueue patch
 - [x] e2e before/after matrix in `tests/e2e/provisioning/`
-- [ ] Decide how a workload whose provisioning check stays `Pending` releases its quota (AKS never fails the request)
+- [x] Release quota when the provisioning check stays `Pending`: `--provisioning-timeout`
+- [ ] Pick a production default for `provisioningTimeout` and decide whether a timed-out workload should be requeued instead of left deactivated
+- [ ] Surface the `ProvisioningTimeout` event in `tau run status`
 - [ ] Update Terraform docs with agentpool `min_count=0` note
 - [ ] Helm opt-in values schema (`values.schema.json`) update
 - [ ] License-header check on `provisioning_ready.go`

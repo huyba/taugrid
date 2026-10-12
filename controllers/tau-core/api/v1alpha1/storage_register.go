@@ -3,6 +3,11 @@
 
 package v1alpha1
 
+import "k8s.io/apimachinery/pkg/runtime"
+
 func init() {
-	SchemeBuilder.Register(&DataIngestion{}, &DataIngestionList{})
+	SchemeBuilder.Register(func(scheme *runtime.Scheme) error {
+		scheme.AddKnownTypes(GroupVersion, &DataIngestion{}, &DataIngestionList{})
+		return nil
+	})
 }

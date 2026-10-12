@@ -13,6 +13,13 @@ image:
   tag: "0.4.4"
   pullPolicy: IfNotPresent
 
+# Deactivate a Kueue Workload that has held quota this long while its
+# ProvisioningRequest admission check is still Pending, so the quota is released
+# when Cluster Autoscaler never finds the capacity. Go duration, e.g. "30m".
+# Empty disables the timeout. Requires capacity-aware admission and a controller
+# image that supports --provisioning-timeout.
+provisioningTimeout: ""
+
 resources:
   requests:
     cpu: 50m

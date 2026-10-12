@@ -107,6 +107,11 @@ rules:
   - apiGroups: ["kueue.x-k8s.io"]
     resources: ["workloads"]
     verbs: ["get", "list", "watch"]
+  {{- if .Values.provisioningTimeout }}
+  - apiGroups: ["kueue.x-k8s.io"]
+    resources: ["workloads"]
+    verbs: ["patch"]
+  {{- end }}
   - apiGroups: ["kueue.x-k8s.io"]
     resources: ["admissionchecks"]
     verbs: ["get", "list", "watch"]

@@ -2,7 +2,8 @@
 
 Everything here was run on a real AKS cluster on 2026-10-12. It compares
 **before** (quota-only admission) with **after** (admission gated by a
-ProvisioningRequest AdmissionCheck) across four scenarios.
+ProvisioningRequest AdmissionCheck) across four scenarios, and then shows the two ways a gated queue gets its quota
+back when capacity does not arrive.
 
 | Document | Contents |
 |---|---|
@@ -12,20 +13,24 @@ ProvisioningRequest AdmissionCheck) across four scenarios.
 
 ## Summary
 
-All eight tests pass. What they show:
+All tests pass. What they show:
 
 1. **Success works.** With the gate, Kueue held the Job suspended until the AKS
    Cluster Autoscaler scaled the pool from zero and reported `Provisioned=True`.
-2. **The gate does not release quota when capacity never arrives.** The AKS
-   autoscaler does not fail an unsatisfiable request; it reports
+2. **The gate alone does not release quota when capacity never arrives.** The
+   AKS autoscaler does not fail an unsatisfiable request; it reports
    `CapacityIsNotFound` and keeps retrying. Kueue keeps the quota reserved and a
-   second job stays starved, exactly as in quota-only mode. In a 21-minute watch
-   the request never failed. The design doc previously claimed quota is released
-   immediately; that is not what AKS does.
-3. **What the gate does change in that case** is what is left lying around: the
-   Job stays suspended, no pod is created, and the reason is visible on the
-   ProvisioningRequest instead of on an `Unschedulable` pod.
-4. **Cancellation and cleanup are clean in both modes.** Deleting the Job removes
+   second job stays starved, as in quota-only mode. In a 21-minute watch the
+   request never failed.
+3. **If the autoscaler does report `Failed`, Kueue releases the quota.** With
+   the default retry settings the starved job got the quota about 60 seconds
+   after the failure.
+4. **A provisioning timeout closes the gap.** The new
+   `--provisioning-timeout` in tau-core-controller deactivates a workload whose
+   provisioning check has been pending too long. With a 45s timeout the stuck
+   workload was deactivated 45 seconds after it reserved quota, its
+   ProvisioningRequest was removed, and the starved job got the quota.
+5. **Cancellation and cleanup are clean in both modes.** Deleting the Job removes
    the Workload, pods and ProvisioningRequest and frees the quota.
 
 ## Environment
@@ -52,20 +57,27 @@ E2E_PROVISIONING_NODE_SELECTOR='demo=provisioning' \
 go test -v -timeout 40m ./provisioning/
 ```
 
-Output of the full run (20:17:54–20:20:16 UTC, pool already at one node):
+Output of the full run (21:02:02–21:06:43 UTC, pool starting at zero nodes, no
+timeout controller running):
 
 ```text
---- PASS: TestBeforeSuccess (6.41s)
---- PASS: TestAfterSuccess (6.63s)
---- PASS: TestBeforeTimeout (38.68s)
---- PASS: TestAfterTimeout (42.82s)
---- PASS: TestBeforeCancellation (4.43s)
---- PASS: TestAfterCancellation (10.52s)
---- PASS: TestBeforeCleanup (10.57s)
---- PASS: TestAfterCleanup (18.73s)
+--- PASS: TestBeforeSuccess (78.42s)
+--- PASS: TestAfterSuccess (8.57s)
+--- PASS: TestBeforeTimeout (36.68s)
+--- PASS: TestAfterTimeout (44.97s)
+--- PASS: TestBeforeCancellation (4.40s)
+--- PASS: TestAfterCancellation (10.56s)
+--- PASS: TestBeforeCleanup (10.61s)
+--- PASS: TestAfterCleanup (16.75s)
+--- PASS: TestAfterFailedReleasesQuota (66.62s)
+--- SKIP: TestAfterTimeoutReleasesQuota (0.00s)
 PASS
-ok  	github.com/Azure/taugrid/tests/e2e/provisioning	140.527s
+ok  	github.com/Azure/taugrid/tests/e2e/provisioning	279.361s
 ```
+
+`TestBeforeSuccess` ran first and paid for the scale-up; `TestAfterSuccess`
+then found the node already there. `TestAfterTimeoutReleasesQuota` needs the
+timeout controller and was run separately (scenario 6): pass, 52.21s.
 
 ## Results by scenario
 
@@ -138,6 +150,9 @@ does not apply either; it bounds how long provisioned capacity is held, not how
 long provisioning may take. Whether the autoscaler eventually gives up after a
 longer period was not observed.
 
+This is the behaviour without the provisioning timeout. Scenario 6 shows the
+same case with the timeout enabled.
+
 ### 3. Cancellation — job deleted while waiting for capacity
 
 Job: the 600 CPU job, deleted once it is waiting.
@@ -170,21 +185,109 @@ returned to zero nodes about 14 minutes after the last job was removed, even
 while an unsatisfiable ProvisioningRequest was still pending in another
 namespace.
 
+## Releasing quota when capacity does not arrive
+
+Both tests use the gated queue and the same pair of jobs as the timeout
+scenario: a 600 CPU job that can never be provisioned, and a second 600 CPU job
+starved by it.
+
+### 5. Failed — the autoscaler gives up
+
+`TestAfterFailedReleasesQuota` — pass (66.5s).
+
+The AKS autoscaler was never seen to fail a request, so the test writes the
+`Failed=True` condition onto the ProvisioningRequest, as the autoscaler would.
+State 45 seconds into the run:
+
+```text
+ProvisioningRequest: Accepted=True  Provisioned=False/CapacityIsNotFound  Failed=True/SimulatedByTest
+job-too-big:  QuotaReserved=True  check=Retry "Retrying after failure: e2e test marked the request as failed"
+              requeueState.requeueAt = 60s after the failure
+job-starved:  QuotaReserved=False "insufficient unused quota for cpu ..., 200 more needed"
+```
+
+| Step | Result |
+|---|---|
+| Kueue sees `Failed=True` | AdmissionCheck goes `Pending → Retry`, requeue scheduled 60s out |
+| During the backoff | Quota is still held by the failed workload |
+| After the backoff (about 60s) | Starved job gets `QuotaReserved=True` |
+| Failed job | Still suspended, never got a pod |
+
+The 60 seconds is Kueue's default `retryStrategy.backoffBaseSeconds`. The chart
+exposes it as `capacityAwareAdmission.admissionCheck.minBackoffSeconds`, with
+`retryLimit` bounding how many times the workload is retried before the check is
+rejected.
+
+### 6. Timeout — the autoscaler never answers
+
+`TestAfterTimeoutReleasesQuota` — pass (52.2s), with the
+`ProvisioningTimeoutReconciler` running against the cluster at a 45s timeout.
+
+| Step | Result |
+|---|---|
+| Stuck workload holds quota for 45s | Controller sets `spec.active=false` on the Workload |
+| Kueue | Evicts the workload: `QuotaReserved=False`; deletes the ProvisioningRequest |
+| Starved job | Gets `QuotaReserved=True` |
+| Timed-out job | Still suspended, never got a pod |
+| Why | Warning event `ProvisioningTimeout` on the Workload |
+
+Controller log:
+
+```text
+INFO  Starting workers  {"controller": "provisioning-timeout", "controllerKind": "Workload"}
+INFO  deactivated workload after provisioning timeout  {"Workload": {"name":"job-too-big-b74d9","namespace":"e2e-capacity-after"}, "admissionCheck": "e2e-capacity-after-check", "waited": "45.074249s"}
+```
+
+The timed-out workload stays deactivated; it is not retried. The user has to
+resubmit, or delete the Job.
+
+How this was run: the full tau-core-controller cannot start on this cluster (the
+TauGrid CRDs are not installed), so only this reconciler was run from a
+workstation against the cluster, using the gated harness in the controller
+module. The code path is the one `--provisioning-timeout` enables in the real
+controller, but the controller image and chart wiring were not exercised.
+
+```bash
+# terminal 1: the reconciler, 45s timeout, runs for 4 minutes
+cd controllers/tau-core
+TAU_PROVISIONING_TIMEOUT_LIVE=45s TAU_PROVISIONING_TIMEOUT_LIVE_RUN=4m \
+go test -run '^TestProvisioningTimeoutLive$' -timeout 10m ./internal/controller/
+
+# terminal 2: the e2e test, told what timeout the controller uses
+cd tests/e2e
+AI_RUNTIME_E2E=1 E2E_PROVISIONING=1 E2E_PROVISIONING_TIMEOUT=45s \
+E2E_PROVISIONING_NODE_SELECTOR='demo=provisioning' \
+go test -v -run '^TestAfterTimeoutReleasesQuota$' ./provisioning/
+```
+
+`TestAfterTimeout` (scenario 2) is skipped when `E2E_PROVISIONING_TIMEOUT` is
+set, because with the controller running the workload no longer stays stuck.
+
+To enable the timeout in a deployment:
+
+```yaml
+tau-core-controller:
+  provisioningTimeout: 30m
+```
+
 ## What this means for the design
 
 - The gate delivers the headline behaviour of issue #278: no pods and no resumed
   Job until nodes exist.
-- It does **not** by itself solve "quota is taken but not used and the next job
-  cannot proceed". On AKS that still needs a manual delete, or a separate
-  mechanism that deactivates a workload whose check has been `Pending` too long.
-  The retry settings in `ProvisioningRequestConfig.spec.retryStrategy` only act
-  after the autoscaler reports a failure, which did not happen here.
-- The failure-mode table in the design doc has been corrected accordingly.
+- By itself it does not solve "quota is taken but not used and the next job
+  cannot proceed", because the AKS autoscaler never fails the request. The
+  provisioning timeout is what releases the quota in that case.
+- If the autoscaler does fail a request, Kueue's own retry-then-reject handling
+  releases the quota without TauGrid's involvement.
+- The failure-mode table in the design doc reflects all three.
 
 ## Not covered
 
 - GPU pools and GPU VM sizes; multi-node requests and atomicity (M < N nodes).
-- A request that the autoscaler accepts and then fails, booking expiry, retries.
+- A failure reported by the real autoscaler (it was simulated), booking expiry,
+  and what happens after the retry limit is exhausted.
+- The provisioning timeout inside the deployed controller image, and its chart
+  wiring. The chart tests could not be run here (`helm` is not installed).
 - Cancellation during an in-flight scale-up.
 - The pinned Kueue v0.19.2 build.
 - The TauGrid chart, CLI and `ProvisioningReady` observer. These tests use plain
