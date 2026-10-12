@@ -241,24 +241,66 @@ INFO  deactivated workload after provisioning timeout  {"Workload": {"name":"job
 The timed-out workload stays deactivated; it is not retried. The user has to
 resubmit, or delete the Job.
 
-How this was run: the full tau-core-controller cannot start on this cluster (the
-TauGrid CRDs are not installed), so only this reconciler was run from a
-workstation against the cluster, using the gated harness in the controller
-module. The code path is the one `--provisioning-timeout` enables in the real
-controller, but the controller image and chart wiring were not exercised.
+This was run two ways, both from a workstation against the cluster (no
+controller image was deployed):
+
+1. **Only the timeout reconciler**, through the gated harness in the controller
+   module. Result above (52.2s).
+2. **The full tau-core-controller binary** built from this branch, after
+   installing the three TauGrid CRDs from `charts/tau-core-controller/crds/`.
+   All four reconcilers started (TauCluster, TauWorkspace, TauQuotaRequest and
+   provisioning-timeout) with no errors logged, and the whole test package was
+   run against it:
+
+```text
+--- PASS: TestBeforeSuccess (82.41s)
+--- PASS: TestAfterSuccess (6.42s)
+--- PASS: TestBeforeTimeout (38.84s)
+--- SKIP: TestAfterTimeout (0.00s)
+--- PASS: TestBeforeCancellation (4.48s)
+--- PASS: TestAfterCancellation (10.61s)
+--- PASS: TestBeforeCleanup (10.72s)
+--- PASS: TestAfterCleanup (16.71s)
+--- PASS: TestAfterFailedReleasesQuota (66.33s)
+--- PASS: TestAfterTimeoutReleasesQuota (50.07s)
+PASS
+ok  	github.com/Azure/taugrid/tests/e2e/provisioning	288.471s
+```
 
 ```bash
-# terminal 1: the reconciler, 45s timeout, runs for 4 minutes
+# full controller, 45s timeout
+kubectl apply --server-side -f charts/tau-core-controller/crds/
 cd controllers/tau-core
+go run ./cmd/controller --provisioning-timeout=45s \
+  --metrics-bind-address=0 --health-probe-bind-address=0
+
+# the reconciler alone, where the CRDs are not installed
 TAU_PROVISIONING_TIMEOUT_LIVE=45s TAU_PROVISIONING_TIMEOUT_LIVE_RUN=4m \
 go test -run '^TestProvisioningTimeoutLive$' -timeout 10m ./internal/controller/
 
-# terminal 2: the e2e test, told what timeout the controller uses
+# in another terminal: the e2e tests, told what timeout the controller uses
 cd tests/e2e
 AI_RUNTIME_E2E=1 E2E_PROVISIONING=1 E2E_PROVISIONING_TIMEOUT=45s \
 E2E_PROVISIONING_NODE_SELECTOR='demo=provisioning' \
-go test -v -run '^TestAfterTimeoutReleasesQuota$' ./provisioning/
+go test -v -timeout 30m ./provisioning/
 ```
+
+Two things the full run showed about choosing the timeout:
+
+- **It must be longer than a normal scale-up.** The clock starts when quota is
+  reserved, and a cold scale-up here took about 85s. With a 45s timeout a job
+  that needs a new node would be deactivated before the node arrives.
+  `TestAfterSuccess` passed only because the node was already up.
+- **It interacts with Kueue's retry backoff.** In the failed-request test the
+  controller deactivated the failed workload 60s after it reserved quota (its
+  log shows `waited: 1m0.08s`), which is when Kueue's 60s retry backoff ended.
+  The likely cause is that the check went back to `Pending` while the original
+  reservation time was still in place; this was not investigated further. A
+  timeout well above `backoffBaseSeconds` avoids it, but a shorter one can turn
+  the first retry into a termination.
+
+Still not exercised: the controller image, in-cluster RBAC (the `patch` rule on
+workloads) and the Helm wiring.
 
 `TestAfterTimeout` (scenario 2) is skipped when `E2E_PROVISIONING_TIMEOUT` is
 set, because with the controller running the workload no longer stays stuck.
@@ -286,8 +328,9 @@ tau-core-controller:
 - GPU pools and GPU VM sizes; multi-node requests and atomicity (M < N nodes).
 - A failure reported by the real autoscaler (it was simulated), booking expiry,
   and what happens after the retry limit is exhausted.
-- The provisioning timeout inside the deployed controller image, and its chart
-  wiring. The chart tests could not be run here (`helm` is not installed).
+- The provisioning timeout in a deployed controller image, its in-cluster RBAC
+  and its chart wiring. The controller was run from a workstation, and the
+  chart tests could not be run here (`helm` is not installed).
 - Cancellation during an in-flight scale-up.
 - The pinned Kueue v0.19.2 build.
 - The TauGrid chart, CLI and `ProvisioningReady` observer. These tests use plain
