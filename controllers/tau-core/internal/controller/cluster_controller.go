@@ -40,6 +40,7 @@ const (
 type TauClusterReconciler struct {
 	client.Client
 	MultiKueuePrerequisites MultiKueuePrerequisiteReader
+	ProvisioningReadiness   ProvisioningReadinessReader
 }
 
 type nodeReconcileState struct {
@@ -67,6 +68,8 @@ type topologyReconcileState struct {
 // +kubebuilder:rbac:groups=kueue.x-k8s.io,resources=clusterqueues,verbs=get;list;watch;update
 // +kubebuilder:rbac:groups=kueue.x-k8s.io,resources=resourceflavors,verbs=get;list;watch;create
 // +kubebuilder:rbac:groups=kueue.x-k8s.io,resources=topologies,verbs=get;list;watch;create
+// +kubebuilder:rbac:groups=kueue.x-k8s.io,resources=admissionchecks,verbs=get;list;watch
+// +kubebuilder:rbac:groups=kueue.x-k8s.io,resources=provisioningrequestconfigs,verbs=get;list;watch
 // +kubebuilder:rbac:groups=scheduling.k8s.io,resources=priorityclasses,verbs=get;list;watch
 
 func (r *TauClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -78,14 +81,16 @@ func (r *TauClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 	mode := cluster.Spec.ManagementMode
 
 	var (
-		nodeState           nodeReconcileState
-		nodeErr             error
-		topologyState       topologyReconcileState
-		topologyErr         error
-		profileState        profileObservationState
-		profileErr          error
-		multiKueueCondition metav1.Condition
-		multiKueueErr       error
+		nodeState             nodeReconcileState
+		nodeErr               error
+		topologyState         topologyReconcileState
+		topologyErr           error
+		profileState          profileObservationState
+		profileErr            error
+		multiKueueCondition   metav1.Condition
+		multiKueueErr         error
+		provisioningCondition metav1.Condition
+		provisioningErr       error
 	)
 	if cluster.Name == tauv1alpha1.TauClusterSingletonName {
 		nodeState, nodeErr = r.reconcileNodeLabels(ctx, &cluster, mode == tauv1alpha1.ClusterManagementModeReconcile)
@@ -95,25 +100,26 @@ func (r *TauClusterReconciler) Reconcile(ctx context.Context, req ctrl.Request) 
 			mode == tauv1alpha1.ClusterManagementModeReconcile && !nodeState.reconciliationFailed,
 		)
 		multiKueueCondition, multiKueueErr = r.multiKueueReadinessCondition(ctx, cluster.Generation)
+		provisioningCondition, provisioningErr = r.provisioningReadinessCondition(ctx, cluster.Generation)
 		profileCluster := cluster.DeepCopy()
 		profileCluster.Status.Conditions = mergeConditions(
 			cluster.Status.Conditions,
-			[]metav1.Condition{multiKueueCondition},
+			[]metav1.Condition{multiKueueCondition, provisioningCondition},
 		)
 		profileState, profileErr = r.observeWorkloadProfiles(ctx, profileCluster)
 	}
 
-	desired := tauClusterStatus(&cluster, mode, nodeState, topologyState, profileState, multiKueueCondition)
+	desired := tauClusterStatus(&cluster, mode, nodeState, topologyState, profileState, multiKueueCondition, provisioningCondition)
 	result := ctrl.Result{RequeueAfter: nodeResyncPeriod}
 	if equalTauClusterStatus(cluster.Status, desired) {
-		return result, errors.Join(nodeErr, topologyErr, profileErr, multiKueueErr)
+		return result, errors.Join(nodeErr, topologyErr, profileErr, multiKueueErr, provisioningErr)
 	}
 
 	cluster.Status = desired
 	if err := r.Status().Update(ctx, &cluster); err != nil {
-		return ctrl.Result{}, errors.Join(nodeErr, topologyErr, profileErr, multiKueueErr, err)
+		return ctrl.Result{}, errors.Join(nodeErr, topologyErr, profileErr, multiKueueErr, provisioningErr, err)
 	}
-	return result, errors.Join(nodeErr, topologyErr, profileErr, multiKueueErr)
+	return result, errors.Join(nodeErr, topologyErr, profileErr, multiKueueErr, provisioningErr)
 }
 
 func (r *TauClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
@@ -129,6 +135,7 @@ func (r *TauClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(newQueueObject(resourceFlavorGVK), handler.EnqueueRequestsFromMapFunc(enqueueTauClusterForProfileDependency)).
 		Watches(newQueueObject(topologyGVK), handler.EnqueueRequestsFromMapFunc(enqueueTauClusterForProfileDependency)).
 		Watches(newQueueObject(workloadPriorityClassGVK), handler.EnqueueRequestsFromMapFunc(enqueueTauClusterForProfileDependency)).
+		Watches(newQueueObject(admissionCheckGVK), handler.EnqueueRequestsFromMapFunc(enqueueTauClusterForProvisioningDependency)).
 		Watches(&schedulingv1.PriorityClass{}, handler.EnqueueRequestsFromMapFunc(enqueueTauClusterForProfileDependency)).
 		Complete(r)
 }
@@ -138,6 +145,10 @@ func enqueueTauClusterForNode(context.Context, client.Object) []reconcile.Reques
 }
 
 func enqueueTauClusterForProfileDependency(context.Context, client.Object) []reconcile.Request {
+	return enqueueTauClusterSingleton()
+}
+
+func enqueueTauClusterForProvisioningDependency(context.Context, client.Object) []reconcile.Request {
 	return enqueueTauClusterSingleton()
 }
 
@@ -414,6 +425,7 @@ func tauClusterStatus(
 	topology topologyReconcileState,
 	profiles profileObservationState,
 	multiKueueCondition metav1.Condition,
+	provisioningCondition metav1.Condition,
 ) tauv1alpha1.TauClusterStatus {
 	generation := cluster.Generation
 	if cluster.Name != tauv1alpha1.TauClusterSingletonName {
@@ -421,6 +433,7 @@ func tauClusterStatus(
 			condition(tauv1alpha1.ConditionNodesReady, metav1.ConditionUnknown, "ObservationSkipped", "node discovery requires the TauCluster singleton named cluster", generation),
 			condition(tauv1alpha1.ConditionWorkloadProfilesReady, metav1.ConditionUnknown, "ObservationSkipped", "workload profile observation requires the TauCluster singleton named cluster", generation),
 			condition(tauv1alpha1.ConditionMultiKueueReady, metav1.ConditionUnknown, "ObservationSkipped", "MultiKueue observation requires the TauCluster singleton named cluster", generation),
+			condition(tauv1alpha1.ConditionProvisioningReady, metav1.ConditionUnknown, "ObservationSkipped", "provisioning observation requires the TauCluster singleton named cluster", generation),
 			condition(tauv1alpha1.ConditionQueuesReady, metav1.ConditionUnknown, "ObservationPending", "queue observation is not enabled", generation),
 			condition(tauv1alpha1.ConditionWorkspacesReady, metav1.ConditionUnknown, "ObservationPending", "workspace aggregation is not enabled", generation),
 			condition(tauv1alpha1.ConditionDriftDetected, metav1.ConditionUnknown, "ObservationSkipped", "node discovery requires the TauCluster singleton named cluster", generation),
@@ -443,6 +456,7 @@ func tauClusterStatus(
 		nodes.nodesCondition,
 		profiles.condition,
 		multiKueueCondition,
+		provisioningCondition,
 		topology.queuesCondition,
 		condition(tauv1alpha1.ConditionWorkspacesReady, metav1.ConditionUnknown, "ObservationPending", "workspace aggregation is not enabled", generation),
 		mergeClusterCondition(

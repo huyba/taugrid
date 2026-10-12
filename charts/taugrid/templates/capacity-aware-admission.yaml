@@ -1,0 +1,73 @@
+{{- /*
+  capacity-aware-admission.yaml
+  Kueue objects required for ProvisioningRequest-gated admission on
+  scale-from-zero GPU pools. Disabled by default; platform engineers
+  opt in by setting capacityAwareAdmission.enabled=true.
+
+  Objects created when enabled:
+    - ProvisioningRequestConfig  (kueue.x-k8s.io/v1beta1)
+    - AdmissionCheck             (kueue.x-k8s.io/v1beta2)
+    - ResourceFlavor             (kueue.x-k8s.io/v1beta1)
+
+  The ClusterQueue admissionChecksStrategy must be patched separately
+  via cluster-overlays to scope the check to the GPU flavor only.
+*/ -}}
+{{- if .Values.capacityAwareAdmission.enabled }}
+---
+# ProvisioningRequestConfig configures which provisioning class Kueue
+# requests and which resources the Cluster Autoscaler should track.
+apiVersion: kueue.x-k8s.io/v1beta1
+kind: ProvisioningRequestConfig
+metadata:
+  name: {{ .Values.capacityAwareAdmission.provisioningRequestConfig.name }}
+  labels:
+    app.kubernetes.io/managed-by: {{ .Release.Name }}
+    app.kubernetes.io/component: capacity-aware-admission
+spec:
+  provisioningClassName: {{ .Values.capacityAwareAdmission.provisioningClass }}
+  managedResources:
+  {{- range .Values.capacityAwareAdmission.provisioningRequestConfig.managedResources }}
+  - {{ . }}
+  {{- end }}
+  parameters:
+    # Seconds after which a pending booking expires if CA cannot provision.
+    ValidUntilSeconds: "{{ .Values.capacityAwareAdmission.provisioningRequestConfig.bookingExpirationSeconds }}"
+---
+# AdmissionCheck instructs Kueue to gate admission until CA confirms
+# the ProvisioningRequest has been fulfilled (Provisioned: True).
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: AdmissionCheck
+metadata:
+  name: {{ .Values.capacityAwareAdmission.admissionCheck.name }}
+  labels:
+    app.kubernetes.io/managed-by: {{ .Release.Name }}
+    app.kubernetes.io/component: capacity-aware-admission
+spec:
+  controllerName: kueue.x-k8s.io/provisioning-request
+  retryDelayMinutes: {{ div .Values.capacityAwareAdmission.admissionCheck.minBackoffSeconds 60 }}
+  parameters:
+    apiGroup: kueue.x-k8s.io
+    kind: ProvisioningRequestConfig
+    name: {{ .Values.capacityAwareAdmission.provisioningRequestConfig.name }}
+---
+# ResourceFlavor for GPU nodes that scale from zero. The node labels must
+# match the AKS agentpool labels set by the Terraform node pool definition.
+apiVersion: kueue.x-k8s.io/v1beta1
+kind: ResourceFlavor
+metadata:
+  name: {{ .Values.capacityAwareAdmission.gpuFlavor.name }}
+  labels:
+    app.kubernetes.io/managed-by: {{ .Release.Name }}
+    app.kubernetes.io/component: capacity-aware-admission
+spec:
+  nodeLabels:
+    kubernetes.azure.com/agentpool: {{ .Values.capacityAwareAdmission.gpuFlavor.agentPool }}
+    {{- if .Values.capacityAwareAdmission.gpuFlavor.instanceType }}
+    node.kubernetes.io/instance-type: {{ .Values.capacityAwareAdmission.gpuFlavor.instanceType }}
+    {{- end }}
+  tolerations:
+  - key: sku
+    value: gpu
+    operator: Equal
+    effect: NoSchedule
+{{- end }}

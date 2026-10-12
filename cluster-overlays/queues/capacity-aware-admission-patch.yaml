@@ -1,0 +1,23 @@
+# Capacity-aware admission patch for ClusterQueue.
+#
+# Apply this overlay AFTER enabling capacityAwareAdmission in the Helm chart.
+# It scopes the ProvisioningRequest AdmissionCheck to the scale-from-zero GPU
+# flavor only, so CPU smoke tests continue to admit without a provisioning gate.
+#
+# Per design decision D4, this ClusterQueue must not also use MultiKueue
+# admission checks. Use separate ClusterQueues for MultiKueue and provisioning
+# workloads.
+#
+# Usage:
+#   kubectl apply -f cluster-overlays/queues/capacity-aware-admission-patch.yaml
+---
+apiVersion: kueue.x-k8s.io/v1beta1
+kind: ClusterQueue
+metadata:
+  name: cluster-queue
+spec:
+  admissionChecksStrategy:
+    admissionChecks:
+    - name: taugrid-provisioning-admission-check
+      onFlavors:
+      - taugrid-gpu-scale-from-zero

@@ -39,6 +39,7 @@ const (
 	ConditionWorkspacesReady       = "WorkspacesReady"
 	ConditionWorkloadProfilesReady = "WorkloadProfilesReady"
 	ConditionMultiKueueReady       = "MultiKueueReady"
+	ConditionProvisioningReady     = "ProvisioningReady"
 	ConditionObserveOnly           = "ObserveOnly"
 	ConditionOwnershipConflict     = "OwnershipConflict"
 	ConditionReconcilePaused       = "ReconcilePaused"

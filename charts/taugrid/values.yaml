@@ -180,3 +180,47 @@ taugrid-core:
       create: true
   lifecycleRecorder:
     enabled: false
+
+# Capacity-aware admission via Kueue ProvisioningRequest AdmissionCheck.
+# When enabled, Kueue reserves quota then waits for Cluster Autoscaler to
+# confirm atomic scale-up before admitting any workload on the GPU flavor.
+# Disabled by default; quota-only admission remains the default install.
+#
+# To enable:
+#   helm upgrade taugrid . --set capacityAwareAdmission.enabled=true \
+#     --set capacityAwareAdmission.gpuFlavor.agentPool=<your-agentpool> \
+#     --set capacityAwareAdmission.gpuFlavor.instanceType=<aks-vm-size>
+capacityAwareAdmission:
+  enabled: false
+
+  # AKS provisioning class. best-effort-atomic-scale-up enforces gang semantics
+  # at the node level: all-or-nothing. The check-capacity class only tests nodes
+  # that already exist and cannot scale from zero; do not use it here.
+  provisioningClass: best-effort-atomic-scale-up.autoscaling.x-k8s.io
+
+  admissionCheck:
+    name: taugrid-provisioning-admission-check
+    # Kueue retries the AdmissionCheck up to retryLimit times after failure.
+    retryLimit: 3
+    # Back-off window between retries (seconds). retryDelayMinutes = minBackoffSeconds / 60.
+    minBackoffSeconds: 60
+    maxBackoffSeconds: 1800
+
+  provisioningRequestConfig:
+    name: taugrid-provisioning-request-config
+    # Resources tracked by CA for capacity decisions. GPU quota is the only
+    # resource that currently gates scale-from-zero on AKS.
+    managedResources:
+      - nvidia.com/gpu
+    # CA must set Provisioned=True within this many seconds or the booking expires.
+    bookingExpirationSeconds: 600
+
+  gpuFlavor:
+    # Name for the scale-from-zero ResourceFlavor added alongside the default GPU flavor.
+    name: taugrid-gpu-scale-from-zero
+    # AKS agentpool label value. Must match the kubernetes.azure.com/agentpool
+    # label applied by the Terraform node pool definition.
+    agentPool: gpupool
+    # Optional: pin to a specific VM SKU. Leave empty to match all GPU nodes
+    # in the agentPool (useful when the pool contains a single SKU).
+    instanceType: ""
