@@ -86,6 +86,60 @@ node level.
 10. [TauGrid]    Observer streams: Capacity Provisioning → Pod Scheduling → Running
 ```
 
+### Sequence Diagram — Happy Path
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor U as User
+    participant CLI as TauGrid CLI
+    participant API as K8s API Server
+    participant KQ as Kueue
+    participant PR as ProvisioningRequest CRD
+    participant CA as Cluster Autoscaler
+    participant Ray as KubeRay Operator
+    participant TAU as TauCluster Observer
+
+    U->>CLI: tau run --gpu A100 --replicas 8
+    CLI->>API: POST RayJob { suspend: true }
+    API->>KQ: AdmissionWebhook intercept
+    KQ->>KQ: Reserve quota · 8× A100<br/>(suspend: true — no Pods yet)
+    KQ->>PR: Create ProvisioningRequest<br/>{ class: best-effort-atomic-scale-up, nodeCount: 8 }
+    PR->>CA: Watch: new PR detected
+    CA->>CA: ScaleUp VMSS: +8 × NC96 A100<br/>(Azure Cloud Provider API)
+    CA-->>PR: Provisioned: True (all 8 nodes NodeReady)
+    PR-->>KQ: etcd status update
+    KQ->>API: Patch RayJob { suspend: false }<br/>AdmissionCheck → Ready
+    API->>Ray: RayJob unsuspended
+    Ray->>API: Create Ray Head + 7 Worker Pods (Pending)
+    API->>API: kube-scheduler binds Pods → NC96 nodes<br/>kubelet → Pods Running
+    API-->>TAU: WorkloadAdmitted + PodsRunning events
+    TAU-->>CLI: Phase: Provisioning → Scheduling → Running
+    CLI-->>U: ✓ Job running (8× A100 nodes)
+```
+
+### Sequence Diagram — Cancellation During Scale-Up
+
+```mermaid
+sequenceDiagram
+    actor U as User
+    participant CLI as TauGrid CLI
+    participant API as K8s API Server
+    participant KQ as Kueue
+    participant PR as ProvisioningRequest CRD
+    participant CA as Cluster Autoscaler
+
+    Note over PR,CA: Provisioning in progress…
+
+    U->>CLI: tau cancel <job-id>
+    CLI->>API: Delete RayJob
+    API->>KQ: Workload deleted event
+    KQ->>KQ: Release ClusterQueue quota
+    KQ->>PR: Delete ProvisioningRequest (OwnerReference GC)
+    PR->>CA: ProvisioningRequest deleted
+    CA->>CA: Cancel in-flight VMSS scale operation<br/>Scale down partially provisioned nodes to 0
+```
+
 ---
 
 ## New Status Phase
@@ -239,6 +293,72 @@ spec:
                 nvidia.com/gpu: "4"
               limits:
                 nvidia.com/gpu: "4"
+```
+
+---
+
+## State Machine
+
+### Workload Lifecycle States
+
+```mermaid
+stateDiagram-v2
+    direction TB
+
+    [*] --> Submitted : tau run
+
+    state "Kueue Quota Check" as QC {
+        Submitted --> QuotaReserved : quota available
+        Submitted --> Queued : quota exhausted
+        Queued --> QuotaReserved : quota freed
+    }
+
+    QuotaReserved --> ProvisioningRequested : Kueue creates ProvisioningRequest\nsuspend: true (no Pods yet)
+
+    state "Cluster Autoscaler" as CA {
+        ProvisioningRequested --> Provisioned : all N nodes NodeReady\nCA sets Provisioned=True
+        ProvisioningRequested --> Failed : CapacityIsNotFound or CA timeout
+        ProvisioningRequested --> BookingExpired : ValidUntilSeconds elapsed
+        ProvisioningRequested --> PartialScale : M < N nodes (atomic violation)
+    }
+
+    Provisioned --> Admitted : Kueue sets suspend=false\nAdmissionCheck → Ready
+
+    state "Pod Lifecycle" as PL {
+        Admitted --> PodPending : KubeRay creates Pods
+        PodPending --> Running : Pods scheduled + containers start
+        Running --> Completed : job exits 0
+        Running --> PodFailed : CrashLoopBackOff / ImagePullBackOff
+        PodFailed --> Running : retry within limit
+        PodFailed --> Evicting : max retries or user cancel
+    }
+
+    Failed --> QuotaReleased : Kueue rejects AdmissionCheck
+    BookingExpired --> QuotaReleased
+    PartialScale --> QuotaReleased : all-or-nothing enforced
+
+    QuotaReleased --> [*] : quota available for next workload
+    Completed --> [*] : OwnerRef GC → ProvisioningRequest → VMSS scale-down
+    Evicting --> [*]
+```
+
+### ProvisioningReady Condition on TauCluster
+
+```mermaid
+stateDiagram-v2
+    direction LR
+    [*] --> NotConfigured : Helm opt-in disabled (default)
+    NotConfigured --> Checking : capacityAwareAdmission.enabled=true
+    Checking --> NoAdmissionCheck : no AdmissionCheck with\ncontrollerName=kueue.x-k8s.io/provisioning-request
+    Checking --> CheckNotActive : AdmissionCheck exists\nbut Active ≠ True
+    Checking --> MissingConfig : AdmissionCheck missing\nspec.parameters.name
+    Checking --> ConfigNotFound : ProvisioningRequestConfig\nnot found
+    Checking --> Ready : AdmissionCheck Active ∧\nProvisioningRequestConfig exists
+    NoAdmissionCheck --> Checking : install Helm objects
+    CheckNotActive --> Checking : Kueue controller becomes ready
+    MissingConfig --> Checking : AdmissionCheck patched
+    ConfigNotFound --> Checking : Config created
+    Ready --> Checking : periodic re-check
 ```
 
 ---
