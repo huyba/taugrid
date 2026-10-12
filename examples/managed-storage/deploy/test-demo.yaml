@@ -211,10 +211,10 @@ spec:
         - sh
         - -c
         - |
-          echo "Checkpoint sidecar started — watching /checkpoints for .done markers"
+          echo "Checkpoint sidecar started — watching /data/checkpoints for .done markers"
           UPLOADED=0
           while true; do
-            for done_file in $(find /checkpoints -name "*.done" 2>/dev/null); do
+            for done_file in $(find /data/checkpoints -name "*.done" 2>/dev/null); do
               ckpt="${done_file%.done}"
               if [ -f "$ckpt" ]; then
                 size=$(wc -c < "$ckpt")
