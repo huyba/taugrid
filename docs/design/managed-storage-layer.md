@@ -22,7 +22,41 @@ on AKS with Kueue and KubeRay.
 
 ---
 
-## 1. Problem Statement
+## 1. Problem Statement & Solution Paradigm
+
+### Solution Paradigm
+
+The Managed Storage Layer decouples infrastructure complexity from the researcher's
+workflow. Instead of manually provisioning storage, writing sidecar containers, and
+configuring Azure Blob uploads, the researcher submits a single `tau.yaml` file:
+
+```
+Researcher writes tau.yaml
+        │
+        ▼ (kubectl apply via tau run)
+DataIngestion CR
+        │
+        ▼
+Tau-Storage-Controller automatically:
+  ├── Provisions the right PVCs (Premium SSD for checkpoints, Azure Files NFS for shared state)
+  ├── Detects NVMe capacity and downgrades HotLoad → StreamMount if needed
+  └── Signals StoragePodInjector to inject init containers + sidecar at admission time
+
+Training Pod gets:
+  ├── /data/datasets/*  — pre-loaded from Azure Blob to local NVMe (zero HTTP during training)
+  ├── /data/checkpoints — async-synced to Azure Blob via inotify sidecar (GPU never waits)
+  └── /data/shared      — RWX NFS mount shared across all distributed workers
+```
+
+The three storage tiers are classified automatically based on access pattern:
+
+| Tier | Access Pattern | Strategy |
+|---|---|---|
+| Datasets | Read-intensive, immutable | `HotLoad` (NVMe cache) or `StreamMount` (BlobFuse2 fallback) |
+| Checkpoints | Write-once, large files | Async inotify sidecar — training writes locally, sidecar uploads in background |
+| Shared State | Concurrent read/write, many workers | Azure Files Premium NFS (RWX, NFS v4.1) |
+
+---
 
 The current TauGrid storage relies on static BlobFuse2 mounts. This causes
 three critical engineering pain points:
@@ -115,7 +149,7 @@ spec:
         container: datasets
         prefix: imagenet/
   checkpoints:
-    localPath: /checkpoints
+    localPath: /data/checkpoints
     syncStrategy: Asynchronous
     retentionCount: 2
     remote:
@@ -473,6 +507,6 @@ examples/managed-storage/
 ├── train.py                          # PyTorch e2e validation training script
 └── pod-validation.yaml              # Fully-expanded pod spec (post-injection)
 
-docs/
-└── managed-storage.md               # This document
+docs/design/
+└── managed-storage-layer.md         # This document
 ```
