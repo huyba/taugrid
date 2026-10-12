@@ -8,8 +8,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(message)s")
 log = logging.getLogger("demo")
 
 DATASET_PATH   = pathlib.Path(os.getenv("DATASET_PATH",   "/data/datasets"))
-CHECKPOINT_DIR = pathlib.Path(os.getenv("CHECKPOINT_DIR", "/checkpoints"))
-SHARED_DIR     = pathlib.Path(os.getenv("SHARED_DIR",     "/shared"))
+CHECKPOINT_DIR = pathlib.Path(os.getenv("CHECKPOINT_DIR", "/data/checkpoints"))
+SHARED_DIR     = pathlib.Path(os.getenv("SHARED_DIR",     "/data/shared"))
 NUM_EPOCHS     = int(os.getenv("NUM_EPOCHS", "5"))
 
 CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
