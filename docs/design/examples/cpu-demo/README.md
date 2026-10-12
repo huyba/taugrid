@@ -1,98 +1,74 @@
 # Capacity-Aware Kueue Admission — AKS run log
 
-**Status: incomplete.** The ProvisioningRequest flow has **not** been observed
-end to end. This page records what was actually run and what it showed. An
-earlier version of this page listed expected output and a ~20s timeline; none of
-that was measured and it has been removed.
+**Result: the flow works on AKS.** A suspended Job was held by Kueue, the AKS
+managed Cluster Autoscaler accepted the ProvisioningRequest and scaled a node
+pool from 0 to 1, and only then was the Job unsuspended. Submit to container
+start took 88 seconds.
+
+Everything on this page was observed on the cluster. What the run does **not**
+cover is listed under [Not tested](#not-tested).
 
 | | |
 |---|---|
-| Date | 2026-10-12 |
+| Date | 2026-10-12 (times UTC) |
 | Cluster | `helmdeep-aks` (`helmdeep-rg`), Kubernetes 1.35.7 |
-| Nodes | 1 × `Standard_B2pls_v2` (arm64), pool `arm`, autoscaling off |
+| System pool | `arm`, 1 × `Standard_B2pls_v2` (arm64), autoscaling off |
+| Demo pool | `prdemo`, `Standard_B2pls_v2`, autoscaler min 0 / max 1, taint `demo=provisioning:NoSchedule`, label `demo=provisioning` |
 | Kueue | upstream v0.20.1 (TauGrid pins the MCR build v0.19.2, which was not tested) |
+| Provisioning class | `best-effort-atomic-scale-up.autoscaling.x-k8s.io` |
+| Workload | `batch/v1` Job, 1 pod, 500m CPU / 256Mi |
 
-## What was run
+## Timeline
 
-1. Installed Kueue v0.20.1 from the upstream release manifest.
-2. Lowered the Kueue manager CPU request from 500m to 100m, because the node had
-   only ~390m unrequested CPU and the pod was `Pending` with `Insufficient cpu`.
-3. Read the Kueue manager log.
-4. Validated the demo manifests and the chart's manifest shapes with
-   `kubectl apply --dry-run=server`.
+| Time | Δ | Event | Source |
+|---|---|---|---|
+| 18:40:52 | 0s | Job applied with `suspend: true` | `kubectl apply` |
+| 18:40:53 | 1s | `QuotaReserved=True`; Kueue creates ProvisioningRequest `job-demo-sleep-job-3de63-demo-provisioning-check-1` | Workload condition, event |
+| 18:40:57 | 5s | `Accepted=True` — "ProvisioningRequest is accepted by ClusterAutoscaler" | ProvisioningRequest condition |
+| 18:41:36 | 44s | Node `aks-prdemo-40886686-vmss000000` created (pool 0 → 1) | Node `creationTimestamp` |
+| 18:42:17 | 85s | `Provisioned=True` — "Capacity is found in the cluster"; AdmissionCheck `Pending → Ready`; Workload `Admitted=True`; Job resumed; pod created | conditions, events |
+| 18:42:20 | 88s | Container started on the new node | Pod event |
+| 18:42:22 | 90s | Workload `PodsReady=True` | Workload condition |
+| — | — | Job `Complete 1/1`; pod log: `admitted after provisioning` | `kubectl get job`, `kubectl logs` |
 
-Nothing else was applied. No queue objects, Job, ProvisioningRequest CRD, or
-node pool were created.
+The node was created 41 seconds **before** the pod existed, so the scale-up was
+driven by the ProvisioningRequest, not by a pending pod. The Job stayed
+`suspend: true` for the whole 85 seconds.
 
-## Findings
+## Setup that was required
 
-### 1. AKS does not ship the ProvisioningRequest CRD, so Kueue disables the feature
+```bash
+# 1. Kueue
+kubectl apply --server-side -f \
+  https://github.com/kubernetes-sigs/kueue/releases/download/v0.20.1/manifests.yaml
+# On this 2-vCPU node the manager was Pending (Insufficient cpu) until:
+kubectl -n kueue-system set resources deploy/kueue-controller-manager \
+  -c manager --requests=cpu=100m,memory=256Mi
 
-Kueue manager log at startup:
+# 2. ProvisioningRequest CRD — AKS does not install it
+kubectl apply --server-side -f \
+  https://raw.githubusercontent.com/kubernetes/autoscaler/master/cluster-autoscaler/apis/config/crd/autoscaling.x-k8s.io_provisioningrequests.yaml
+kubectl -n kueue-system rollout restart deploy/kueue-controller-manager
 
+# 3. Zero-node autoscaled pool
+az aks nodepool add --cluster-name helmdeep-aks --resource-group helmdeep-rg \
+  --name prdemo --mode User --node-vm-size Standard_B2pls_v2 \
+  --enable-cluster-autoscaler --min-count 0 --max-count 1 --node-count 0 \
+  --node-taints demo=provisioning:NoSchedule --labels demo=provisioning
 ```
-"msg":"Skipping admission check controller setup: Provisioning Requests not supported (Possible cause: missing or unsupported cluster-autoscaler)",
-"error":"no matches for kind \"ProvisioningRequest\" in version \"autoscaling.x-k8s.io/v1\""
+
+Step 2 matters. Before the CRD existed, Kueue logged:
+
+```text
 "msg":"Skipping provisioning controller setup: Provisioning Requests not supported (Possible cause: missing or unsupported cluster-autoscaler)"
+"error":"no matches for kind \"ProvisioningRequest\" in version \"autoscaling.x-k8s.io/v1\""
 ```
 
-`kubectl get crd | grep -Ei "provisioningrequest|autoscaling"` returned nothing.
-Kueue checks for the CRD once at startup, so the CRD must be installed before
-Kueue starts (or Kueue restarted afterwards). The runbook in the design doc does
-not include this step.
+Kueue checks once at startup, hence the restart. After it, the
+`provisioning-workload-reconciler` started and the AdmissionCheck went
+`Active=True` ("The admission check is active").
 
-### 2. No Cluster Autoscaler was running
-
-`az aks show` reports `enableAutoScaling: false` on the only pool. Without an
-autoscaler nothing sets `Provisioned=True`. Whether the **AKS managed** Cluster
-Autoscaler processes ProvisioningRequests at all (it requires
-`--enable-provisioning-requests` upstream, which AKS does not expose as a
-setting) is **unverified** and is the main open risk for this design.
-
-### 3. Kueue v0.20.1 serves only `v1beta2`
-
-```
-admissionchecks:            v1beta1(served=false) v1beta2(served=true,storage=true)
-provisioningrequestconfigs: v1beta1(served=false) v1beta2(served=true,storage=true)
-clusterqueues:              v1beta1(served=false) v1beta2(served=true,storage=true)
-resourceflavors:            v1beta1(served=false) v1beta2(served=true,storage=true)
-```
-
-Affected in this branch (all use `kueue.x-k8s.io/v1beta1`):
-
-- `charts/taugrid/templates/capacity-aware-admission.yaml` — `ProvisioningRequestConfig`, `ResourceFlavor`
-- `cluster-overlays/queues/capacity-aware-admission-patch.yaml` — `ClusterQueue`
-- `controllers/tau-core/internal/controller/provisioning_ready.go` — `provisioningRequestConfigGVK`
-
-Server response for a `v1beta1` `ProvisioningRequestConfig`:
-
-```
-no matches for kind "ProvisioningRequestConfig" in version "kueue.x-k8s.io/v1beta1"
-```
-
-Not checked against the pinned v0.19.2 build, which may still serve `v1beta1`.
-
-### 4. The chart's AdmissionCheck is rejected by the `v1beta2` schema
-
-```
-AdmissionCheck in version "v1beta2" cannot be handled as a AdmissionCheck:
-strict decoding error: unknown field "spec.retryDelayMinutes"
-```
-
-`v1beta2` `AdmissionCheck.spec` has only `controllerName` and `parameters`.
-Retry settings live on `ProvisioningRequestConfig.spec.retryStrategy`
-(`backoffLimitCount`, `backoffBaseSeconds`, `backoffMaxSeconds`).
-
-### 5. `v1beta2` LocalQueue uses `spec.clusterQueue`
-
-```
-LocalQueue in version "v1beta2" cannot be handled as a LocalQueue:
-strict decoding error: unknown field "spec.clusterQueueName"
-```
-
-## Manifests that pass server-side validation on v0.20.1
-
-Validated with `--dry-run=server` only; not applied.
+## Manifests applied
 
 ```yaml
 apiVersion: kueue.x-k8s.io/v1beta2
@@ -150,43 +126,116 @@ spec:
     - name: demo-provisioning-check
       onFlavors:
       - demo-cpu-flavor
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: LocalQueue
+metadata:
+  name: demo-local-queue
+  namespace: tau-demo
+spec:
+  clusterQueue: demo-cluster-queue
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: demo-sleep-job
+  namespace: tau-demo
+  labels:
+    kueue.x-k8s.io/queue-name: demo-local-queue
+spec:
+  suspend: true
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: demo
+        image: busybox:1.36
+        command: ["sh", "-c", "echo admitted after provisioning; sleep 30"]
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "256Mi"
 ```
 
-## Remaining steps to complete the run
+## Observed objects
 
-These were not executed (they change cluster infrastructure and need the cluster
-owner's go-ahead):
+ProvisioningRequest (created by Kueue, owned by the Workload):
 
-```bash
-# 1. Zero-node autoscaled pool, tainted so nothing else lands on it
-az aks nodepool add --cluster-name helmdeep-aks --resource-group helmdeep-rg \
-  --name prdemo --mode User --node-vm-size Standard_B2pls_v2 \
-  --enable-cluster-autoscaler --min-count 0 --max-count 1 --node-count 0 \
-  --node-taints demo=provisioning:NoSchedule --labels demo=provisioning
-
-# 2. ProvisioningRequest CRD, then restart Kueue so it detects it
-kubectl apply --server-side -f \
-  https://raw.githubusercontent.com/kubernetes/autoscaler/master/cluster-autoscaler/apis/config/crd/autoscaling.x-k8s.io_provisioningrequests.yaml
-kubectl -n kueue-system rollout restart deploy/kueue-controller-manager
-
-# 3. Apply the manifests above plus a LocalQueue (spec.clusterQueue) and a
-#    suspended Job labelled kueue.x-k8s.io/queue-name, tolerating the taint.
-
-# 4. Observe
-kubectl get provisioningrequests -A -w
-kubectl get workloads -A -o wide
+```text
+owner=Workload/job-demo-sleep-job-3de63
+class=best-effort-atomic-scale-up.autoscaling.x-k8s.io params={"ValidUntilSeconds":"600"}
+podSets=[{"count":1,"podTemplateRef":{"name":"ppt-job-demo-sleep-job-3de63-demo-provisioning-check-1-main"}}]
+2026-10-12T18:40:57Z Accepted=True    reason=Accepted              msg=ProvisioningRequest is accepted by ClusterAutoscaler
+2026-10-12T18:42:17Z Provisioned=True reason=CapacityIsProvisioned msg=Capacity is found in the cluster
 ```
 
-The result to record is whether the managed autoscaler sets `Provisioned=True`
-and scales `prdemo` from 0 to 1, or leaves the request unanswered.
+Workload:
+
+```text
+2026-10-12T18:40:53Z QuotaReserved=True reason=QuotaReserved
+2026-10-12T18:42:17Z Admitted=True      reason=Admitted
+2026-10-12T18:42:22Z PodsReady=True     reason=Started
+check demo-provisioning-check state=Ready msg=Capacity is found in the cluster
+event: Admitted by ClusterQueue demo-cluster-queue, wait time since reservation was 84s
+```
+
+Pod, as mutated by Kueue on admission (the Job template had no selector,
+toleration, or annotations):
+
+```text
+node=aks-prdemo-40886686-vmss000000
+nodeSelector={"demo":"provisioning"}
+toleration={"effect":"NoSchedule","key":"demo","operator":"Equal","value":"provisioning"}
+autoscaling.x-k8s.io/consume-provisioning-request=job-demo-sleep-job-3de63-demo-provisioning-check-1
+autoscaling.x-k8s.io/provisioning-class-name=best-effort-atomic-scale-up.autoscaling.x-k8s.io
+```
+
+## Issues found in this branch
+
+Found by server-side dry run against Kueue v0.20.1. Not checked against the
+pinned v0.19.2 build, which may behave differently.
+
+1. **`v1beta1` is not served.** Only `kueue.x-k8s.io/v1beta2` is served for
+   AdmissionCheck, ProvisioningRequestConfig, ClusterQueue and ResourceFlavor.
+   Affected: `charts/taugrid/templates/capacity-aware-admission.yaml`
+   (ProvisioningRequestConfig, ResourceFlavor),
+   `cluster-overlays/queues/capacity-aware-admission-patch.yaml` (ClusterQueue),
+   and `provisioningRequestConfigGVK` in `provisioning_ready.go`.
+2. **The chart's AdmissionCheck is rejected:**
+   `strict decoding error: unknown field "spec.retryDelayMinutes"`. Retry
+   settings belong in `ProvisioningRequestConfig.spec.retryStrategy`
+   (`backoffLimitCount`, `backoffBaseSeconds`, `backoffMaxSeconds`).
+3. **`v1beta2` LocalQueue uses `spec.clusterQueue`**, not `spec.clusterQueueName`.
+4. **The runbook omits the ProvisioningRequest CRD install**, without which
+   Kueue silently disables the feature.
+
+## Not tested
+
+- GPU node pools and GPU VM sizes (this was one arm64 CPU node).
+- Atomicity: a request for N > 1 nodes where only M < N can be provisioned.
+- Failure paths: capacity exhaustion, `ValidUntilSeconds` expiry, retries.
+- Cancellation while provisioning is in flight.
+- The MCR Kueue v0.19.2 build that TauGrid pins.
+- The TauGrid chart, CLI, and the `ProvisioningReady` observer (the observer is
+  not wired in `main.go`). Only upstream Kueue objects were used.
+- Scale-down of `prdemo` back to zero after the Job finished.
 
 ## Cluster state left by this run
 
-- Namespace `kueue-system` with Kueue v0.20.1, its CRDs, and its webhook
-  configurations (manager CPU request patched to 100m).
+- `kueue-system`: Kueue v0.20.1, its CRDs and webhooks (manager CPU request 100m).
+- CRD `provisioningrequests.autoscaling.x-k8s.io`.
+- Node pool `prdemo` (autoscaled 0–1; one node was up when the run ended).
+- Namespace `tau-demo` and the cluster-scoped `demo-*` Kueue objects.
 
-Remove with:
+Cleanup:
 
 ```bash
+kubectl delete namespace tau-demo
+kubectl delete clusterqueue demo-cluster-queue
+kubectl delete admissioncheck demo-provisioning-check
+kubectl delete provisioningrequestconfig demo-provisioning-config
+kubectl delete resourceflavor demo-cpu-flavor
 kubectl delete -f https://github.com/kubernetes-sigs/kueue/releases/download/v0.20.1/manifests.yaml
+kubectl delete crd provisioningrequests.autoscaling.x-k8s.io
+az aks nodepool delete --cluster-name helmdeep-aks --resource-group helmdeep-rg --name prdemo
 ```

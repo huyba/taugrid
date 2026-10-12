@@ -422,23 +422,37 @@ kubectl get cluster -o jsonpath='{.status.conditions[?(@.type=="ProvisioningRead
 
 ## Worked Example
 
-**Not yet demonstrated end to end.** A partial run on the `helmdeep-aks` AKS
-cluster (2026-10-12, upstream Kueue v0.20.1) is logged in
+The flow was run end to end on the `helmdeep-aks` AKS cluster on 2026-10-12
+with upstream Kueue v0.20.1 and `best-effort-atomic-scale-up`. The full log,
+manifests and cleanup steps are in
 [`docs/design/examples/cpu-demo/README.md`](examples/cpu-demo/README.md).
-No ProvisioningRequest was created and no timings were measured.
+
+Measured, for one 500m-CPU Job on a `Standard_B2pls_v2` pool scaled from zero:
+
+| Δ from submit | Event |
+|---|---|
+| 1s | Quota reserved; Kueue creates the ProvisioningRequest |
+| 5s | AKS managed Cluster Autoscaler sets `Accepted=True` |
+| 44s | New node created (pool 0 → 1), before any pod exists |
+| 85s | `Provisioned=True`; Kueue admits the Workload and resumes the Job |
+| 88s | Container started on the new node |
 
 What the run established:
 
-- AKS does not install the `ProvisioningRequest` CRD. Without it Kueue logs
-  `Skipping provisioning controller setup: Provisioning Requests not supported`
-  and the AdmissionCheck can never become Active.
-- Whether the AKS managed Cluster Autoscaler answers ProvisioningRequests is
-  unverified. This is the main open risk for the design.
+- The AKS managed Cluster Autoscaler does process ProvisioningRequests and
+  scales from zero for this class.
+- AKS does not install the `ProvisioningRequest` CRD. It must be installed
+  before Kueue starts; otherwise Kueue logs `Skipping provisioning controller
+  setup: Provisioning Requests not supported` and disables the feature.
 - Kueue v0.20.1 serves only `kueue.x-k8s.io/v1beta2`. The `v1beta1` manifests
   and GVK in this branch are rejected there (not checked on the pinned v0.19.2).
 - `spec.retryDelayMinutes` is not a field of `v1beta2` `AdmissionCheck`; the
   chart template is rejected by the API server. Retry settings belong in
   `ProvisioningRequestConfig.spec.retryStrategy`.
+
+Not covered by the run: GPU pools, multi-node atomicity, failure and
+cancellation paths, the pinned Kueue v0.19.2 build, and the TauGrid chart, CLI
+and `ProvisioningReady` observer.
 
 ---
 
