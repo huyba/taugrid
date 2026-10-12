@@ -4,5 +4,5 @@
 package v1alpha1
 
 func init() {
-	SchemeBuilder.Register(&DataIngestion{}, &DataIngestionList{})
+	SchemeBuilder.Register(&DataFetch{}, &DataFetchList{})
 }

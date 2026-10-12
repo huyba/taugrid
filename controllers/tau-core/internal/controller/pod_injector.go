@@ -20,9 +20,9 @@ import (
 )
 
 const (
-	// AnnotationDataIngestion is the pod annotation that links a pod to a
-	// DataIngestion resource: tau.azure.com/data-ingestion: <name>
-	AnnotationDataIngestion = "tau.azure.com/data-ingestion"
+	// AnnotationDataFetch is the pod annotation that links a pod to a
+	// DataFetch resource: tau.azure.com/data-fetch: <name>
+	AnnotationDataFetch = "tau.azure.com/data-fetch"
 
 	// Image references — override via controller flags for air-gapped clusters.
 	DefaultInitImage    = "ghcr.io/azure/taugrid/tau-init:latest"
@@ -30,7 +30,7 @@ const (
 )
 
 // StoragePodInjector is a mutating admission webhook that injects init and
-// sidecar containers into pods annotated with tau.azure.com/data-ingestion.
+// sidecar containers into pods annotated with tau.azure.com/data-fetch.
 //
 // Register with the controller-runtime webhook server in main.go:
 //
@@ -48,7 +48,7 @@ func (i *StoragePodInjector) InjectDecoder(d admission.Decoder) error {
 	return nil
 }
 
-// Handle implements admission.Handler. It reads the DataIngestion referenced
+// Handle implements admission.Handler. It reads the DataFetch referenced
 // by the pod annotation and calls InjectStorageContainers to mutate the pod.
 func (i *StoragePodInjector) Handle(ctx context.Context, req admission.Request) admission.Response {
 	logger := log.FromContext(ctx)
@@ -58,17 +58,17 @@ func (i *StoragePodInjector) Handle(ctx context.Context, req admission.Request) 
 		return admission.Errored(http.StatusBadRequest, err)
 	}
 
-	diName := pod.Annotations[AnnotationDataIngestion]
+	diName := pod.Annotations[AnnotationDataFetch]
 	if diName == "" {
-		return admission.Allowed("no data-ingestion annotation")
+		return admission.Allowed("no data-fetch annotation")
 	}
 
-	var di tauv1alpha1.DataIngestion
+	var di tauv1alpha1.DataFetch
 	if err := i.Client.Get(ctx, types.NamespacedName{
 		Name:      diName,
 		Namespace: req.Namespace,
 	}, &di); err != nil {
-		logger.Error(err, "failed to fetch DataIngestion", "name", diName)
+		logger.Error(err, "failed to fetch DataFetch", "name", diName)
 		return admission.Errored(http.StatusInternalServerError, err)
 	}
 
@@ -99,7 +99,7 @@ func (i *StoragePodInjector) Handle(ctx context.Context, req admission.Request) 
 //
 // This function is also callable outside the webhook (e.g. from a controller
 // that directly manages JobSets or RayJobs).
-func InjectStorageContainers(pod *corev1.Pod, di *tauv1alpha1.DataIngestion, initImg, sidecarImg string) error {
+func InjectStorageContainers(pod *corev1.Pod, di *tauv1alpha1.DataFetch, initImg, sidecarImg string) error {
 	if di == nil {
 		return nil
 	}

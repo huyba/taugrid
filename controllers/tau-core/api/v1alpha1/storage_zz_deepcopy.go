@@ -92,9 +92,9 @@ func (in *SharedStateSpec) DeepCopy() *SharedStateSpec {
 	return out
 }
 
-// ---------- DataIngestionSpec ----------
+// ---------- DataFetchSpec ----------
 
-func (in *DataIngestionSpec) DeepCopyInto(out *DataIngestionSpec) {
+func (in *DataFetchSpec) DeepCopyInto(out *DataFetchSpec) {
 	*out = *in
 	if in.Datasets != nil {
 		in, out := &in.Datasets, &out.Datasets
@@ -122,35 +122,35 @@ func (in *DataIngestionSpec) DeepCopyInto(out *DataIngestionSpec) {
 	}
 }
 
-func (in *DataIngestionSpec) DeepCopy() *DataIngestionSpec {
+func (in *DataFetchSpec) DeepCopy() *DataFetchSpec {
 	if in == nil {
 		return nil
 	}
-	out := new(DataIngestionSpec)
+	out := new(DataFetchSpec)
 	in.DeepCopyInto(out)
 	return out
 }
 
-// ---------- DataIngestionDatasetStatus ----------
+// ---------- DataFetchDatasetStatus ----------
 
-func (in *DataIngestionDatasetStatus) DeepCopyInto(out *DataIngestionDatasetStatus) { *out = *in }
+func (in *DataFetchDatasetStatus) DeepCopyInto(out *DataFetchDatasetStatus) { *out = *in }
 
-func (in *DataIngestionDatasetStatus) DeepCopy() *DataIngestionDatasetStatus {
+func (in *DataFetchDatasetStatus) DeepCopy() *DataFetchDatasetStatus {
 	if in == nil {
 		return nil
 	}
-	out := new(DataIngestionDatasetStatus)
+	out := new(DataFetchDatasetStatus)
 	*out = *in
 	return out
 }
 
-// ---------- DataIngestionStatus ----------
+// ---------- DataFetchStatus ----------
 
-func (in *DataIngestionStatus) DeepCopyInto(out *DataIngestionStatus) {
+func (in *DataFetchStatus) DeepCopyInto(out *DataFetchStatus) {
 	*out = *in
 	if in.Datasets != nil {
 		in, out := &in.Datasets, &out.Datasets
-		*out = make([]DataIngestionDatasetStatus, len(*in))
+		*out = make([]DataFetchDatasetStatus, len(*in))
 		copy(*out, *in)
 	}
 	if in.Conditions != nil {
@@ -162,18 +162,18 @@ func (in *DataIngestionStatus) DeepCopyInto(out *DataIngestionStatus) {
 	}
 }
 
-func (in *DataIngestionStatus) DeepCopy() *DataIngestionStatus {
+func (in *DataFetchStatus) DeepCopy() *DataFetchStatus {
 	if in == nil {
 		return nil
 	}
-	out := new(DataIngestionStatus)
+	out := new(DataFetchStatus)
 	in.DeepCopyInto(out)
 	return out
 }
 
-// ---------- DataIngestion ----------
+// ---------- DataFetch ----------
 
-func (in *DataIngestion) DeepCopyInto(out *DataIngestion) {
+func (in *DataFetch) DeepCopyInto(out *DataFetch) {
 	*out = *in
 	out.TypeMeta = in.TypeMeta
 	in.ObjectMeta.DeepCopyInto(&out.ObjectMeta)
@@ -181,47 +181,47 @@ func (in *DataIngestion) DeepCopyInto(out *DataIngestion) {
 	in.Status.DeepCopyInto(&out.Status)
 }
 
-func (in *DataIngestion) DeepCopy() *DataIngestion {
+func (in *DataFetch) DeepCopy() *DataFetch {
 	if in == nil {
 		return nil
 	}
-	out := new(DataIngestion)
+	out := new(DataFetch)
 	in.DeepCopyInto(out)
 	return out
 }
 
-func (in *DataIngestion) DeepCopyObject() runtime.Object {
+func (in *DataFetch) DeepCopyObject() runtime.Object {
 	if c := in.DeepCopy(); c != nil {
 		return c
 	}
 	return nil
 }
 
-// ---------- DataIngestionList ----------
+// ---------- DataFetchList ----------
 
-func (in *DataIngestionList) DeepCopyInto(out *DataIngestionList) {
+func (in *DataFetchList) DeepCopyInto(out *DataFetchList) {
 	*out = *in
 	out.TypeMeta = in.TypeMeta
 	in.ListMeta.DeepCopyInto(&out.ListMeta)
 	if in.Items != nil {
 		in, out := &in.Items, &out.Items
-		*out = make([]DataIngestion, len(*in))
+		*out = make([]DataFetch, len(*in))
 		for i := range *in {
 			(*in)[i].DeepCopyInto(&(*out)[i])
 		}
 	}
 }
 
-func (in *DataIngestionList) DeepCopy() *DataIngestionList {
+func (in *DataFetchList) DeepCopy() *DataFetchList {
 	if in == nil {
 		return nil
 	}
-	out := new(DataIngestionList)
+	out := new(DataFetchList)
 	in.DeepCopyInto(out)
 	return out
 }
 
-func (in *DataIngestionList) DeepCopyObject() runtime.Object {
+func (in *DataFetchList) DeepCopyObject() runtime.Object {
 	if c := in.DeepCopy(); c != nil {
 		return c
 	}

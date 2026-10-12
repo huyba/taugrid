@@ -1,8 +1,8 @@
 ---
-# Sample DataIngestion CR — applies all three storage tiers simultaneously.
+# Sample DataFetch CR — applies all three storage tiers simultaneously.
 # Deploy to the same namespace as your training job.
 apiVersion: tau.azure.com/v1alpha1
-kind: DataIngestion
+kind: DataFetch
 metadata:
   name: llm-training-storage
   namespace: research-team-a

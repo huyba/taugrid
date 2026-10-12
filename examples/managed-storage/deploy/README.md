@@ -180,7 +180,7 @@ az aks nodepool add \
 
 ```bash
 # Install CRD
-kubectl apply -f ../../controllers/tau-core/config/crd/bases/tau.azure.com_dataingestions.yaml
+kubectl apply -f ../../controllers/tau-core/config/crd/bases/tau.azure.com_datafetches.yaml
 
 # Run demo
 kubectl apply -f test-demo.yaml

@@ -24,6 +24,40 @@ on AKS with Kueue and KubeRay.
 
 ## 1. Problem Statement & Solution Paradigm
 
+### Solution Paradigm
+
+The Managed Storage Layer decouples infrastructure complexity from the researcher's
+workflow. Instead of manually provisioning storage, writing sidecar containers, and
+configuring Azure Blob uploads, the researcher submits a single `tau.yaml` file:
+
+```
+Researcher writes tau.yaml
+        │
+        ▼ (kubectl apply via tau run)
+DataFetch CR
+        │
+        ▼
+Tau-Storage-Controller automatically:
+  ├── Provisions the right PVCs (Premium SSD for checkpoints, Azure Files NFS for shared state)
+  ├── Detects NVMe capacity and downgrades HotLoad → StreamMount if needed
+  └── Signals StoragePodInjector to inject init containers + sidecar at admission time
+
+Training Pod gets:
+  ├── /data/datasets/*  — pre-loaded from Azure Blob to local NVMe (zero HTTP during training)
+  ├── /data/checkpoints — async-synced to Azure Blob via inotify sidecar (GPU never waits)
+  └── /data/shared      — RWX NFS mount shared across all distributed workers
+```
+
+The three storage tiers are classified automatically based on access pattern:
+
+| Tier | Access Pattern | Strategy |
+|---|---|---|
+| Datasets | Read-intensive, immutable | `HotLoad` (NVMe cache) or `StreamMount` (BlobFuse2 fallback) |
+| Checkpoints | Write-once, large files | Async inotify sidecar — training writes locally, sidecar uploads in background |
+| Shared State | Concurrent read/write, many workers | Azure Files Premium NFS (RWX, NFS v4.1) |
+
+---
+
 ### Problem Statement
 
 The current TauGrid storage implementation relies heavily on static volume mappings
@@ -99,12 +133,12 @@ The three storage tiers are classified automatically based on access pattern:
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                     Researcher: tau run --config tau.yaml               │
 └───────────────────────────────────┬─────────────────────────────────────┘
-                                    │ kubectl apply (DataIngestion CR)
+                                    │ kubectl apply (DataFetch CR)
                                     ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
 │                         Kube-API-Server / etcd                          │
 └───────────────────────────────────┬─────────────────────────────────────┘
-                                    │ Watch: DataIngestion CRD events
+                                    │ Watch: DataFetch CRD events
                                     ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
 │              Tau-Storage-Controller (Go / controller-runtime)           │
@@ -151,14 +185,14 @@ The three storage tiers are classified automatically based on access pattern:
 
 ## 3. Component Deep Dive
 
-### 3.1 DataIngestion CRD
+### 3.1 DataFetch CRD
 
-The `DataIngestion` custom resource is the single interface between the
+The `DataFetch` custom resource is the single interface between the
 researcher and the storage infrastructure.
 
 ```yaml
 apiVersion: tau.azure.com/v1alpha1
-kind: DataIngestion
+kind: DataFetch
 metadata:
   name: my-run
 spec:
@@ -194,7 +228,7 @@ The controller reconciliation loop:
 ```
 Reconcile(req)
   │
-  ├── Get DataIngestion CR
+  ├── Get DataFetch CR
   ├── Add finalizer (first run)
   │
   ├── reconcileDatasets()
@@ -208,16 +242,16 @@ Reconcile(req)
   ├── reconcileCheckpointPVC()
   │     └── Create RWO PVC (managed-csi-premium, 200Gi) if absent
   │
-  └── Update DataIngestion.Status (phase=Ready, PVC names)
+  └── Update DataFetch.Status (phase=Ready, PVC names)
 ```
 
 **Register in main.go:**
 ```go
-if err := (&controller.DataIngestionReconciler{
+if err := (&controller.DataFetchReconciler{
     Client:          mgr.GetClient(),
     SystemNamespace: cfg.SystemNamespace,
 }).SetupWithManager(mgr); err != nil {
-    setupLog.Error(err, "unable to create DataIngestion controller")
+    setupLog.Error(err, "unable to create DataFetch controller")
     os.Exit(1)
 }
 ```
@@ -226,10 +260,10 @@ if err := (&controller.DataIngestionReconciler{
 
 Located at [controllers/tau-core/internal/controller/pod_injector.go](../controllers/tau-core/internal/controller/pod_injector.go).
 
-When a pod with annotation `tau.azure.com/data-ingestion: <name>` is admitted,
+When a pod with annotation `tau.azure.com/data-fetch: <name>` is admitted,
 the webhook:
 
-1. Fetches the referenced DataIngestion CR
+1. Fetches the referenced DataFetch CR
 2. For each **HotLoad** dataset: injects an `init-dataset-*` container + emptyDir volume
 3. For each **StreamMount** dataset: injects an inline BlobFuse2 CSI volume
 4. If checkpoints configured: injects `checkpoint-sidecar` container + PVC mount
@@ -306,7 +340,7 @@ tau-sidecar boot
 
 The `sharedState` tier provisions a single Azure Files Premium RWX PVC mounted
 at `/data/shared` across every worker pod in the job. Because the webhook injects
-the same volume definition from the same `DataIngestion` CR into every pod, all
+the same volume definition from the same `DataFetch` CR into every pod, all
 workers automatically share the same mount path with no per-worker configuration.
 
 The following patterns cover the typical coordination needs of distributed training:
@@ -579,13 +613,13 @@ kubectl create secret generic azure-blob-creds \
     -n research-team-a
 
 # Install CRD
-kubectl apply -f controllers/tau-core/config/crd/bases/tau.azure.com_dataingestions.yaml
+kubectl apply -f controllers/tau-core/config/crd/bases/tau.azure.com_datafetches.yaml
 ```
 
-### Deploy DataIngestion
+### Deploy DataFetch
 
 ```bash
-kubectl apply -f controllers/tau-core/config/samples/tau.azure.com_v1alpha1_dataingestion.yaml
+kubectl apply -f controllers/tau-core/config/samples/tau.azure.com_v1alpha1_datafetch.yaml
 kubectl get di -n research-team-a -w
 ```
 
@@ -619,7 +653,7 @@ tau run --config examples/managed-storage/tau.yaml
 controllers/
 ├── tau-core/
 │   ├── api/v1alpha1/
-│   │   ├── storage_types.go          # DataIngestion CRD Go types
+│   │   ├── storage_types.go          # DataFetch CRD Go types
 │   │   ├── storage_register.go       # Scheme registration
 │   │   └── storage_zz_deepcopy.go   # DeepCopy implementations
 │   ├── internal/controller/
@@ -627,9 +661,9 @@ controllers/
 │   │   └── pod_injector.go          # Mutating webhook: init + sidecar injection
 │   └── config/
 │       ├── crd/bases/
-│       │   └── tau.azure.com_dataingestions.yaml  # CRD manifest
+│       │   └── tau.azure.com_datafetches.yaml  # CRD manifest
 │       └── samples/
-│           └── tau.azure.com_v1alpha1_dataingestion.yaml  # Sample CR
+│           └── tau.azure.com_v1alpha1_datafetch.yaml  # Sample CR
 ├── tau-sidecar/
 │   ├── go.mod
 │   └── cmd/sidecar/main.go          # inotify watcher + async upload + retry

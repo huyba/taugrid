@@ -19,7 +19,7 @@ Researcher writes tau.yaml
         │
         ▼
 ┌───────────────────────────────────────────────────────────────┐
-│  DataIngestion CR                                             │
+│  DataFetch CR                                             │
 │  ┌─────────────────┐  ┌───────────────────┐  ┌────────────┐  │
 │  │ datasets:       │  │ checkpoints:      │  │sharedState:│  │
 │  │  HotLoad / ▼    │  │  localPath: /ckpt │  │  type: NFS │  │
@@ -51,7 +51,7 @@ Researcher writes tau.yaml
 
 ## Pod Injection Flow
 
-When a pod has the annotation `tau.azure.com/data-ingestion: <name>`, the
+When a pod has the annotation `tau.azure.com/data-fetch: <name>`, the
 mutating webhook automatically injects all storage containers:
 
 ```
@@ -157,7 +157,7 @@ examples/managed-storage/
 
 ```bash
 # 1. Install CRD
-kubectl apply -f ../../controllers/tau-core/config/crd/bases/tau.azure.com_dataingestions.yaml
+kubectl apply -f ../../controllers/tau-core/config/crd/bases/tau.azure.com_datafetches.yaml
 
 # 2. Deploy demo (no GPU, no custom Docker image required)
 kubectl apply -f deploy/test-demo.yaml

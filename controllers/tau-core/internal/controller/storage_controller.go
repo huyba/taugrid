@@ -22,7 +22,7 @@ import (
 )
 
 const (
-	dataIngestionFinalizer = "tau.azure.com/data-ingestion-protection"
+	dataFetchFinalizer = "tau.azure.com/data-fetch-protection"
 
 	// defaultNFSStorageClass is the Azure Files Premium NFS storage class with
 	// nconnect=4, rsize/wsize=1048576 mount options configured at cluster level.
@@ -40,24 +40,24 @@ const (
 	storageRetryInterval   = 15 * time.Second
 )
 
-// DataIngestionReconciler manages storage infrastructure for DataIngestion CRs.
-type DataIngestionReconciler struct {
+// DataFetchReconciler manages storage infrastructure for DataFetch CRs.
+type DataFetchReconciler struct {
 	client.Client
 	// SystemNamespace scopes the controller to a single namespace; empty means cluster-wide.
 	SystemNamespace string
 }
 
-// +kubebuilder:rbac:groups=tau.azure.com,resources=dataingestions,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=tau.azure.com,resources=dataingestions/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=tau.azure.com,resources=dataingestions/finalizers,verbs=update
+// +kubebuilder:rbac:groups=tau.azure.com,resources=datafetches,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=tau.azure.com,resources=datafetches/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=tau.azure.com,resources=datafetches/finalizers,verbs=update
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
 
-func (r *DataIngestionReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	logger := log.FromContext(ctx).WithValues("dataingestion", req.NamespacedName.String())
+func (r *DataFetchReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	logger := log.FromContext(ctx).WithValues("datafetch", req.NamespacedName.String())
 
-	var di tauv1alpha1.DataIngestion
+	var di tauv1alpha1.DataFetch
 	if err := r.Get(ctx, req.NamespacedName, &di); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
@@ -68,8 +68,8 @@ func (r *DataIngestionReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 
 	// Ensure finalizer is set before doing any real work.
-	if !controllerutil.ContainsFinalizer(&di, dataIngestionFinalizer) {
-		controllerutil.AddFinalizer(&di, dataIngestionFinalizer)
+	if !controllerutil.ContainsFinalizer(&di, dataFetchFinalizer) {
+		controllerutil.AddFinalizer(&di, dataFetchFinalizer)
 		if err := r.Update(ctx, &di); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -84,12 +84,12 @@ func (r *DataIngestionReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 }
 
 // reconcileSpec drives the happy-path reconciliation loop.
-func (r *DataIngestionReconciler) reconcileSpec(ctx context.Context, di *tauv1alpha1.DataIngestion) (ctrl.Result, error) {
+func (r *DataFetchReconciler) reconcileSpec(ctx context.Context, di *tauv1alpha1.DataFetch) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
 
-	newStatus := tauv1alpha1.DataIngestionStatus{
+	newStatus := tauv1alpha1.DataFetchStatus{
 		ObservedGeneration: di.Generation,
-		Phase:              tauv1alpha1.DataIngestionPhaseProvisioning,
+		Phase:              tauv1alpha1.DataFetchPhaseProvisioning,
 	}
 
 	// ── 1. Datasets ──────────────────────────────────────────────────────────
@@ -118,7 +118,7 @@ func (r *DataIngestionReconciler) reconcileSpec(ctx context.Context, di *tauv1al
 	}
 
 	// ── 4. Update status ─────────────────────────────────────────────────────
-	newStatus.Phase = tauv1alpha1.DataIngestionPhaseReady
+	newStatus.Phase = tauv1alpha1.DataFetchPhaseReady
 	newStatus.Conditions = []metav1.Condition{
 		{
 			Type:               tauv1alpha1.ConditionReady,
@@ -141,7 +141,7 @@ func (r *DataIngestionReconciler) reconcileSpec(ctx context.Context, di *tauv1al
 
 // reconcileDatasets computes the effective load strategy for every dataset,
 // implementing the NVMe capacity exhaustion fallback from Section 5.
-func (r *DataIngestionReconciler) reconcileDatasets(ctx context.Context, di *tauv1alpha1.DataIngestion) ([]tauv1alpha1.DataIngestionDatasetStatus, error) {
+func (r *DataFetchReconciler) reconcileDatasets(ctx context.Context, di *tauv1alpha1.DataFetch) ([]tauv1alpha1.DataFetchDatasetStatus, error) {
 	logger := log.FromContext(ctx)
 
 	nvmeCap := di.Spec.NVMeCapacityGiB
@@ -157,10 +157,10 @@ func (r *DataIngestionReconciler) reconcileDatasets(ctx context.Context, di *tau
 		}
 	}
 
-	statuses := make([]tauv1alpha1.DataIngestionDatasetStatus, 0, len(di.Spec.Datasets))
+	statuses := make([]tauv1alpha1.DataFetchDatasetStatus, 0, len(di.Spec.Datasets))
 
 	for _, ds := range di.Spec.Datasets {
-		st := tauv1alpha1.DataIngestionDatasetStatus{
+		st := tauv1alpha1.DataFetchDatasetStatus{
 			Name:          ds.Name,
 			Phase:         "Provisioning",
 			EffectiveLoad: ds.LoadStrategy,
@@ -196,7 +196,7 @@ func (r *DataIngestionReconciler) reconcileDatasets(ctx context.Context, di *tau
 
 // reconcileSharedStatePVC ensures the Azure Files Premium NFS PVC exists.
 // This provides ReadWriteMany access for distributed training coordination.
-func (r *DataIngestionReconciler) reconcileSharedStatePVC(ctx context.Context, di *tauv1alpha1.DataIngestion) (string, error) {
+func (r *DataFetchReconciler) reconcileSharedStatePVC(ctx context.Context, di *tauv1alpha1.DataFetch) (string, error) {
 	ss := di.Spec.SharedState
 	pvcName := fmt.Sprintf("%s-shared-state", di.Name)
 
@@ -223,10 +223,10 @@ func (r *DataIngestionReconciler) reconcileSharedStatePVC(ctx context.Context, d
 				Name:      pvcName,
 				Namespace: di.Namespace,
 				Labels: map[string]string{
-					"tau.azure.com/data-ingestion": di.Name,
+					"tau.azure.com/data-fetch": di.Name,
 					"tau.azure.com/storage-tier":   "shared-state",
 				},
-				// Owner reference ensures PVC is garbage-collected with the DataIngestion.
+				// Owner reference ensures PVC is garbage-collected with the DataFetch.
 				OwnerReferences: []metav1.OwnerReference{storageOwnerRef(di)},
 			},
 			Spec: corev1.PersistentVolumeClaimSpec{
@@ -254,7 +254,7 @@ func (r *DataIngestionReconciler) reconcileSharedStatePVC(ctx context.Context, d
 // reconcileCheckpointPVC ensures the Premium SSD PVC for checkpoint staging exists.
 // ReadWriteOnce (local disk) gives maximum write throughput while the async
 // sidecar streams checkpoints to Azure Blob in the background.
-func (r *DataIngestionReconciler) reconcileCheckpointPVC(ctx context.Context, di *tauv1alpha1.DataIngestion) (string, error) {
+func (r *DataFetchReconciler) reconcileCheckpointPVC(ctx context.Context, di *tauv1alpha1.DataFetch) (string, error) {
 	pvcName := fmt.Sprintf("%s-checkpoints", di.Name)
 	storageClass := defaultCheckpointStorageClass
 	rwo := corev1.ReadWriteOnce
@@ -269,7 +269,7 @@ func (r *DataIngestionReconciler) reconcileCheckpointPVC(ctx context.Context, di
 				Name:      pvcName,
 				Namespace: di.Namespace,
 				Labels: map[string]string{
-					"tau.azure.com/data-ingestion": di.Name,
+					"tau.azure.com/data-fetch": di.Name,
 					"tau.azure.com/storage-tier":   "checkpoint",
 				},
 				OwnerReferences: []metav1.OwnerReference{storageOwnerRef(di)},
@@ -295,9 +295,9 @@ func (r *DataIngestionReconciler) reconcileCheckpointPVC(ctx context.Context, di
 	return pvcName, err
 }
 
-func (r *DataIngestionReconciler) reconcileDelete(ctx context.Context, di *tauv1alpha1.DataIngestion) (ctrl.Result, error) {
-	if controllerutil.ContainsFinalizer(di, dataIngestionFinalizer) {
-		controllerutil.RemoveFinalizer(di, dataIngestionFinalizer)
+func (r *DataFetchReconciler) reconcileDelete(ctx context.Context, di *tauv1alpha1.DataFetch) (ctrl.Result, error) {
+	if controllerutil.ContainsFinalizer(di, dataFetchFinalizer) {
+		controllerutil.RemoveFinalizer(di, dataFetchFinalizer)
 		if err := r.Update(ctx, di); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -307,20 +307,20 @@ func (r *DataIngestionReconciler) reconcileDelete(ctx context.Context, di *tauv1
 
 // SetupWithManager registers the controller with the controller-runtime manager.
 // Call this from your main.go after mgr is constructed.
-func (r *DataIngestionReconciler) SetupWithManager(mgr ctrl.Manager) error {
+func (r *DataFetchReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&tauv1alpha1.DataIngestion{}).
+		For(&tauv1alpha1.DataFetch{}).
 		Owns(&corev1.PersistentVolumeClaim{}).
 		Complete(r)
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
-func storageOwnerRef(di *tauv1alpha1.DataIngestion) metav1.OwnerReference {
+func storageOwnerRef(di *tauv1alpha1.DataFetch) metav1.OwnerReference {
 	t := true
 	return metav1.OwnerReference{
 		APIVersion:         tauv1alpha1.GroupVersion.String(),
-		Kind:               tauv1alpha1.KindDataIngestion,
+		Kind:               tauv1alpha1.KindDataFetch,
 		Name:               di.Name,
 		UID:                di.UID,
 		Controller:         &t,
