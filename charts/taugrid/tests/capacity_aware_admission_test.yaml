@@ -1,0 +1,56 @@
+suite: TauGrid capacity-aware admission
+templates:
+  - capacity-aware-admission.yaml
+tests:
+  - it: renders nothing by default
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: renders v1beta2 objects with retries on the ProvisioningRequestConfig
+    set:
+      capacityAwareAdmission.enabled: true
+    asserts:
+      - hasDocuments:
+          count: 3
+      - equal:
+          path: apiVersion
+          value: kueue.x-k8s.io/v1beta2
+      - equal:
+          path: kind
+          value: ProvisioningRequestConfig
+        documentIndex: 0
+      - equal:
+          path: spec.provisioningClassName
+          value: best-effort-atomic-scale-up.autoscaling.x-k8s.io
+        documentIndex: 0
+      - equal:
+          path: spec.retryStrategy
+          value:
+            backoffLimitCount: 3
+            backoffBaseSeconds: 60
+            backoffMaxSeconds: 1800
+        documentIndex: 0
+      - equal:
+          path: kind
+          value: AdmissionCheck
+        documentIndex: 1
+      - equal:
+          path: spec.controllerName
+          value: kueue.x-k8s.io/provisioning-request
+        documentIndex: 1
+      - notExists:
+          path: spec.retryDelayMinutes
+        documentIndex: 1
+      - equal:
+          path: spec.parameters.name
+          value: taugrid-provisioning-request-config
+        documentIndex: 1
+      - equal:
+          path: kind
+          value: ResourceFlavor
+        documentIndex: 2
+      - equal:
+          path: spec.nodeLabels["kubernetes.azure.com/agentpool"]
+          value: gpupool
+        documentIndex: 2

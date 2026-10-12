@@ -39,6 +39,12 @@ AI_RUNTIME_GPU_MONITORING_A100_SELECTOR='<managed A100 selector>' \
 AI_RUNTIME_GPU_MONITORING_H200_SELECTOR='<joined H200 selector>' \
 go test -v -timeout 20m -run '^TestGPUMonitoringRuntimeOnGPUNode$' ./gpu-monitoring/
 
+# Run the capacity-aware admission matrix (needs the ProvisioningRequest CRD
+# and an autoscaled node pool; see "Capacity-Aware Admission Tests" below)
+AI_RUNTIME_E2E=1 E2E_PROVISIONING=1 \
+E2E_PROVISIONING_NODE_SELECTOR='<pool label key>=<value>' \
+go test -v -timeout 40m ./provisioning/
+
 # Run the portable scheduler packing check against a multi-node kind cluster
 AI_RUNTIME_E2E=1 go test -v -timeout 2m ./scheduler/
 
@@ -95,6 +101,7 @@ AI_RUNTIME_E2E=0 go test -count=1 ./...
 | `scheduler/` | 2 | Kubernetes scheduler honors Tau's GPU bin-packing preferred pod affinity and packs single-device plus 2-4 GPU same-node pods onto already-occupied nodes |
 | `stack/` | 7 | Full-stack Kueue → KubeRay → Ray Data **inference** pipeline, GPU variants, **training** SGD loop, Tau Python SDK CPU/GPU entrypoint submit tests, and manual 16-GPU Ray Train nanoGPT conformance |
 | `multisite/` | 1 | Two independently queued GPU Jobs are Running concurrently on Nodes carrying two distinct authoritative `tau.azure.com/site` labels |
+| `provisioning/` | 8 | Capacity-aware admission: success, timeout, cancellation and cleanup, each on a quota-only queue and on a ProvisioningRequest-gated queue |
 
 The Tau Python SDK entrypoint smoke submits a CPU RayJob through
 `tau.train(entrypoint=...)` and verifies a staged pure-Python/PyTorch-shaped
@@ -126,6 +133,32 @@ The 3 CPU quota creates artificial scarcity. Each test asserts on three layers:
 1. **Decision** — Kueue Workload condition (`Admitted=True` or `QuotaReserved=False`)
 2. **Bookkeeping** — LocalQueue pending/admitted counters
 3. **Consequence** — Running pod count (gang = all-or-nothing)
+
+### Capacity-Aware Admission Tests
+
+`provisioning/` runs four scenarios twice against the same autoscaled node pool:
+once on a quota-only ClusterQueue (`TestBefore*`) and once on the same queue
+gated by a ProvisioningRequest AdmissionCheck (`TestAfter*`).
+
+| Scenario | Job | What it checks |
+|----------|-----|----------------|
+| Success | 500m CPU | Before: admitted on quota, no ProvisioningRequest. After: admitted only after `Provisioned=True`; the pod consumes that request |
+| Timeout | 600 CPU (fits no node) | Before: job resumed, pod `Unschedulable`. After: job stays suspended, no pod, request reports `CapacityIsNotFound`. Both: quota stays reserved and a second job is starved until the stuck job is deleted |
+| Cancellation | 600 CPU, deleted while waiting | Workload, pods and ProvisioningRequest are gone and the queue is idle |
+| Cleanup | 500m CPU, `sleep 5` | After the Job finishes the queue is idle and the ProvisioningRequest is removed |
+
+Requirements, in addition to Kueue:
+
+- CRD `provisioningrequests.autoscaling.x-k8s.io` installed before Kueue starts.
+  AKS does not ship it.
+- A Cluster Autoscaler that processes ProvisioningRequests.
+- An autoscaled node pool carrying the label given in
+  `E2E_PROVISIONING_NODE_SELECTOR`. If the pool is tainted, the taint must be
+  the same `key=value` with effect `NoSchedule`.
+
+The package is skipped unless `E2E_PROVISIONING=1`. It is not part of the CI
+workflow. Recorded results are in
+[`docs/design/examples/`](../../docs/design/examples/README.md).
 
 ## How CI Runs These
 

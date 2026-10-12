@@ -11,7 +11,7 @@
 # Usage:
 #   kubectl apply -f cluster-overlays/queues/capacity-aware-admission-patch.yaml
 ---
-apiVersion: kueue.x-k8s.io/v1beta1
+apiVersion: kueue.x-k8s.io/v1beta2
 kind: ClusterQueue
 metadata:
   name: cluster-queue

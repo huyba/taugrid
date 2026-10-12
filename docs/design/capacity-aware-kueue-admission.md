@@ -190,7 +190,7 @@ if cfg.CapacityAwareAdmissionEnabled {
 ### ProvisioningRequestConfig
 
 ```yaml
-apiVersion: kueue.x-k8s.io/v1beta1
+apiVersion: kueue.x-k8s.io/v1beta2
 kind: ProvisioningRequestConfig
 metadata:
   name: taugrid-provisioning-request-config
@@ -200,6 +200,10 @@ spec:
   - nvidia.com/gpu
   parameters:
     ValidUntilSeconds: "600"
+  retryStrategy:
+    backoffLimitCount: 3
+    backoffBaseSeconds: 60
+    backoffMaxSeconds: 1800
 ```
 
 ### AdmissionCheck
@@ -211,7 +215,6 @@ metadata:
   name: taugrid-provisioning-admission-check
 spec:
   controllerName: kueue.x-k8s.io/provisioning-request
-  retryDelayMinutes: 1
   parameters:
     apiGroup: kueue.x-k8s.io
     kind: ProvisioningRequestConfig
@@ -221,7 +224,7 @@ spec:
 ### ResourceFlavor (scale-from-zero GPU)
 
 ```yaml
-apiVersion: kueue.x-k8s.io/v1beta1
+apiVersion: kueue.x-k8s.io/v1beta2
 kind: ResourceFlavor
 metadata:
   name: taugrid-gpu-scale-from-zero
@@ -239,7 +242,7 @@ spec:
 ### ClusterQueue patch (cluster-overlays)
 
 ```yaml
-apiVersion: kueue.x-k8s.io/v1beta1
+apiVersion: kueue.x-k8s.io/v1beta2
 kind: ClusterQueue
 metadata:
   name: cluster-queue
@@ -365,13 +368,18 @@ stateDiagram-v2
 
 ## Failure Modes
 
+Rows marked observed were exercised by the test matrix in
+[`examples/README.md`](examples/README.md). The others are expected behaviour
+that has not been tested.
+
 | Scenario | Trigger | Resolution |
 |----------|---------|------------|
-| Cloud capacity exhaustion | CA marks ProvisioningRequest `Failed` / `CapacityIsNotFound` | Kueue rejects AdmissionCheck, releases quota immediately |
+| Capacity not available (observed on AKS) | CA sets `Provisioned=False` / `CapacityIsNotFound` and keeps retrying; it does not set `Failed` | AdmissionCheck stays `Pending`; Job stays suspended with no pod; **quota stays reserved** and later jobs can starve. No change in a 21-minute watch. Recovery today is deleting the job |
+| Capacity request failed (not observed) | CA sets `Failed=True` | Kueue retries per `retryStrategy`, then rejects the check and releases quota |
 | Booking expiry | `ValidUntilSeconds` elapsed, `Provisioned: True` not set | Same as Failed; Kueue retries up to `retryLimit` |
 | Partial scale-up (atomic violation) | Cloud provisions M < N requested nodes | `best-effort-atomic-scale-up` rejects; atomic cancel; quota released |
 | ImagePullBackOff / CrashLoopBackOff | Nodes provisioned but runtime fails | TauGrid retry policy; on max retries Workload deleted → OwnerRef GC → CA scale-down |
-| User cancellation during scale-up | `tau cancel` while ProvisioningRequest pending | Workload deleted → GC → CA cancels in-flight VMSS operation |
+| User cancellation while waiting | Job deleted while ProvisioningRequest pending | Observed: Workload and ProvisioningRequest are garbage-collected, no pod was created, quota released. Aborting an in-flight VMSS operation was not tested |
 | Label mismatch | ResourceFlavor nodeLabels don't match AKS pool labels | Pods stay Pending; fix `gpuFlavor.agentPool` / `instanceType` in Helm values |
 | MultiKueue conflict | ClusterQueue has both MultiKueue and provisioning checks | Kueue rejects ClusterQueue config; use separate ClusterQueues |
 
@@ -380,9 +388,9 @@ stateDiagram-v2
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `bookingExpirationSeconds` | 600 | Seconds for CA to set `Provisioned: True` |
-| `minBackoffSeconds` | 60 | Initial retry delay after failure |
-| `maxBackoffSeconds` | 1800 | Max retry delay (exponential back-off ceiling) |
-| `retryLimit` | 3 | Max retries before permanent rejection |
+| `minBackoffSeconds` | 60 | Initial retry delay after failure (`retryStrategy.backoffBaseSeconds`) |
+| `maxBackoffSeconds` | 1800 | Max retry delay (`retryStrategy.backoffMaxSeconds`) |
+| `retryLimit` | 3 | Max retries before permanent rejection (`retryStrategy.backoffLimitCount`) |
 
 ---
 
@@ -397,16 +405,22 @@ az aks nodepool update \
   --enable-cluster-autoscaler \
   --min-count 0 --max-count 8
 
-# 2. Install the Helm opt-in objects
+# 2. Install the ProvisioningRequest CRD. AKS does not ship it, and Kueue
+#    disables its provisioning controller at startup when it is missing.
+kubectl apply --server-side -f \
+  https://raw.githubusercontent.com/kubernetes/autoscaler/master/cluster-autoscaler/apis/config/crd/autoscaling.x-k8s.io_provisioningrequests.yaml
+kubectl -n kueue-system rollout restart deploy/kueue-controller-manager
+
+# 3. Install the Helm opt-in objects
 helm upgrade taugrid ./charts/taugrid \
   --set capacityAwareAdmission.enabled=true \
   --set capacityAwareAdmission.gpuFlavor.agentPool=gpupool \
   --set capacityAwareAdmission.gpuFlavor.instanceType=Standard_NC96ads_A100_v4
 
-# 3. Patch ClusterQueue in cluster-overlays
+# 4. Patch ClusterQueue in cluster-overlays
 kubectl apply -f cluster-overlays/<cluster>/clusterqueue-patch.yaml
 
-# 4. Verify TauCluster ProvisioningReady condition
+# 5. Verify TauCluster ProvisioningReady condition
 kubectl get cluster -o jsonpath='{.status.conditions[?(@.type=="ProvisioningReady")]}'
 ```
 
@@ -426,6 +440,9 @@ The flow was run end to end on the `helmdeep-aks` AKS cluster on 2026-10-12
 with upstream Kueue v0.20.1 and `best-effort-atomic-scale-up`. The full log,
 manifests and cleanup steps are in
 [`docs/design/examples/cpu-demo/README.md`](examples/cpu-demo/README.md).
+A before/after test matrix (success, timeout, cancellation, cleanup) and its
+results are in [`docs/design/examples/README.md`](examples/README.md); the tests
+live in `tests/e2e/provisioning/`.
 
 Measured, for one 500m-CPU Job on a `Standard_B2pls_v2` pool scaled from zero:
 
@@ -443,16 +460,19 @@ What the run established:
   scales from zero for this class.
 - AKS does not install the `ProvisioningRequest` CRD. It must be installed
   before Kueue starts; otherwise Kueue logs `Skipping provisioning controller
-  setup: Provisioning Requests not supported` and disables the feature.
-- Kueue v0.20.1 serves only `kueue.x-k8s.io/v1beta2`. The `v1beta1` manifests
-  and GVK in this branch are rejected there (not checked on the pinned v0.19.2).
-- `spec.retryDelayMinutes` is not a field of `v1beta2` `AdmissionCheck`; the
-  chart template is rejected by the API server. Retry settings belong in
-  `ProvisioningRequestConfig.spec.retryStrategy`.
+  setup: Provisioning Requests not supported` and disables the feature. The
+  runbook above now includes this step.
+- Kueue v0.20.1 serves only `kueue.x-k8s.io/v1beta2`, and `v1beta2`
+  `AdmissionCheck` has no `spec.retryDelayMinutes`. The chart template, the
+  ClusterQueue overlay and the observer GVK were moved to `v1beta2`, with retry
+  settings in `ProvisioningRequestConfig.spec.retryStrategy`.
+- When capacity cannot be found, the AKS autoscaler does not fail the request.
+  The quota stays reserved and later jobs starve, as in quota-only mode. The
+  gate keeps the Job suspended and podless, but does not release the quota.
 
-Not covered by the run: GPU pools, multi-node atomicity, failure and
-cancellation paths, the pinned Kueue v0.19.2 build, and the TauGrid chart, CLI
-and `ProvisioningReady` observer.
+Not covered: GPU pools, multi-node atomicity, autoscaler-reported failures and
+retries, cancellation during an in-flight scale-up, the pinned Kueue v0.19.2
+build, and the TauGrid chart, CLI and `ProvisioningReady` observer.
 
 ---
 
@@ -462,7 +482,9 @@ and `ProvisioningReady` observer.
 - [ ] Update `tau run status --watch` to surface the `Capacity Provisioning` phase
 - [ ] Fail `--watch` on `ProvisioningReady: False` / `Reason: ProvisioningAdmissionCheckNotReady`
 - [ ] Add unit tests in `provisioning_ready_test.go`
-- [ ] Add example `cluster-overlays/` ClusterQueue patch
+- [x] Add example `cluster-overlays/` ClusterQueue patch
+- [x] e2e before/after matrix in `tests/e2e/provisioning/`
+- [ ] Decide how a workload whose provisioning check stays `Pending` releases its quota (AKS never fails the request)
 - [ ] Update Terraform docs with agentpool `min_count=0` note
 - [ ] Helm opt-in values schema (`values.schema.json`) update
 - [ ] License-header check on `provisioning_ready.go`

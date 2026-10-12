@@ -258,6 +258,14 @@ func readFixture(name string) ([]byte, error) {
 		}
 		data = bytes.ReplaceAll(data, []byte("{{RAY_IMAGE}}"), []byte(img))
 	}
+	if bytes.Contains(data, []byte("{{PROVISIONING_NODE_SELECTOR_KEY}}")) {
+		key, value, ok := strings.Cut(strings.TrimSpace(os.Getenv("E2E_PROVISIONING_NODE_SELECTOR")), "=")
+		if !ok || key == "" || value == "" {
+			return nil, fmt.Errorf("fixture %s needs E2E_PROVISIONING_NODE_SELECTOR=<key>=<value> for the autoscaled node pool", name)
+		}
+		data = bytes.ReplaceAll(data, []byte("{{PROVISIONING_NODE_SELECTOR_KEY}}"), []byte(key))
+		data = bytes.ReplaceAll(data, []byte("{{PROVISIONING_NODE_SELECTOR_VALUE}}"), []byte(value))
+	}
 	if bytes.Contains(data, []byte("{{NANOGPT_TAS_ANNOTATION}}")) {
 		annotation := "# TAS omitted: the local stack queue flavor is not topology-aware"
 		if liveConformanceUsesArgoCDQueue() {

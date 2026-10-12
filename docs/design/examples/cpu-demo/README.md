@@ -190,35 +190,33 @@ autoscaling.x-k8s.io/consume-provisioning-request=job-demo-sleep-job-3de63-demo-
 autoscaling.x-k8s.io/provisioning-class-name=best-effort-atomic-scale-up.autoscaling.x-k8s.io
 ```
 
-## Issues found in this branch
+## Issues found and fixed in this branch
 
-Found by server-side dry run against Kueue v0.20.1. Not checked against the
-pinned v0.19.2 build, which may behave differently.
+Found by server-side dry run against Kueue v0.20.1, then fixed. The fixed
+object shapes pass a server-side dry run on v0.20.1. Not checked against the
+pinned v0.19.2 build.
 
-1. **`v1beta1` is not served.** Only `kueue.x-k8s.io/v1beta2` is served for
-   AdmissionCheck, ProvisioningRequestConfig, ClusterQueue and ResourceFlavor.
-   Affected: `charts/taugrid/templates/capacity-aware-admission.yaml`
-   (ProvisioningRequestConfig, ResourceFlavor),
-   `cluster-overlays/queues/capacity-aware-admission-patch.yaml` (ClusterQueue),
-   and `provisioningRequestConfigGVK` in `provisioning_ready.go`.
-2. **The chart's AdmissionCheck is rejected:**
-   `strict decoding error: unknown field "spec.retryDelayMinutes"`. Retry
-   settings belong in `ProvisioningRequestConfig.spec.retryStrategy`
-   (`backoffLimitCount`, `backoffBaseSeconds`, `backoffMaxSeconds`).
-3. **`v1beta2` LocalQueue uses `spec.clusterQueue`**, not `spec.clusterQueueName`.
-4. **The runbook omits the ProvisioningRequest CRD install**, without which
-   Kueue silently disables the feature.
+1. **`v1beta1` is not served** by v0.20.1. The chart template, the ClusterQueue
+   overlay and `provisioningRequestConfigGVK` now use `kueue.x-k8s.io/v1beta2`.
+2. **The chart's AdmissionCheck was rejected** for
+   `spec.retryDelayMinutes`. Retry settings now render into
+   `ProvisioningRequestConfig.spec.retryStrategy`.
+3. **`v1beta2` LocalQueue uses `spec.clusterQueue`**, not
+   `spec.clusterQueueName`. Only the demo manifest here was affected.
+4. **The runbook omitted the ProvisioningRequest CRD install.** It is now a
+   step in the design doc's runbook.
 
-## Not tested
+## Not tested in this run
+
+The before/after test matrix in [`../README.md`](../README.md) later covered
+the timeout, cancellation and cleanup paths. Still untested anywhere:
 
 - GPU node pools and GPU VM sizes (this was one arm64 CPU node).
 - Atomicity: a request for N > 1 nodes where only M < N can be provisioned.
-- Failure paths: capacity exhaustion, `ValidUntilSeconds` expiry, retries.
-- Cancellation while provisioning is in flight.
+- A request the autoscaler accepts and then fails; booking expiry; retries.
 - The MCR Kueue v0.19.2 build that TauGrid pins.
 - The TauGrid chart, CLI, and the `ProvisioningReady` observer (the observer is
   not wired in `main.go`). Only upstream Kueue objects were used.
-- Scale-down of `prdemo` back to zero after the Job finished.
 
 ## Cluster state left by this run
 

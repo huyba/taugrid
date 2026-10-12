@@ -1,0 +1,51 @@
+---
+# "Before": quota-only admission. No AdmissionCheck, so Kueue admits a workload
+# as soon as logical quota is available, whether or not nodes exist for it.
+#
+# The flavor targets the autoscaled node pool selected by
+# E2E_PROVISIONING_NODE_SELECTOR=<key>=<value>. If the pool is tainted, the
+# taint must be <key>=<value>:NoSchedule so the flavor's toleration matches.
+#
+# Quota is 1000 CPU: large enough that it never limits the 500m "fits" job, and
+# small enough that the 600 CPU "too big" job starves a second 600 CPU job.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: e2e-capacity-before
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ResourceFlavor
+metadata:
+  name: e2e-capacity-before-flavor
+spec:
+  nodeLabels:
+    "{{PROVISIONING_NODE_SELECTOR_KEY}}": "{{PROVISIONING_NODE_SELECTOR_VALUE}}"
+  tolerations:
+  - key: "{{PROVISIONING_NODE_SELECTOR_KEY}}"
+    operator: Equal
+    value: "{{PROVISIONING_NODE_SELECTOR_VALUE}}"
+    effect: NoSchedule
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ClusterQueue
+metadata:
+  name: e2e-capacity-before-cq
+spec:
+  namespaceSelector: {}
+  resourceGroups:
+  - coveredResources:
+    - "cpu"
+    flavors:
+    - name: e2e-capacity-before-flavor
+      resources:
+      - name: "cpu"
+        nominalQuota: 1000
+  queueingStrategy: BestEffortFIFO
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: LocalQueue
+metadata:
+  name: e2e-capacity-queue
+  namespace: e2e-capacity-before
+spec:
+  clusterQueue: e2e-capacity-before-cq

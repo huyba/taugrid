@@ -5,9 +5,9 @@
   opt in by setting capacityAwareAdmission.enabled=true.
 
   Objects created when enabled:
-    - ProvisioningRequestConfig  (kueue.x-k8s.io/v1beta1)
+    - ProvisioningRequestConfig  (kueue.x-k8s.io/v1beta2)
     - AdmissionCheck             (kueue.x-k8s.io/v1beta2)
-    - ResourceFlavor             (kueue.x-k8s.io/v1beta1)
+    - ResourceFlavor             (kueue.x-k8s.io/v1beta2)
 
   The ClusterQueue admissionChecksStrategy must be patched separately
   via cluster-overlays to scope the check to the GPU flavor only.
@@ -16,7 +16,7 @@
 ---
 # ProvisioningRequestConfig configures which provisioning class Kueue
 # requests and which resources the Cluster Autoscaler should track.
-apiVersion: kueue.x-k8s.io/v1beta1
+apiVersion: kueue.x-k8s.io/v1beta2
 kind: ProvisioningRequestConfig
 metadata:
   name: {{ .Values.capacityAwareAdmission.provisioningRequestConfig.name }}
@@ -32,6 +32,12 @@ spec:
   parameters:
     # Seconds after which a pending booking expires if CA cannot provision.
     ValidUntilSeconds: "{{ .Values.capacityAwareAdmission.provisioningRequestConfig.bookingExpirationSeconds }}"
+  # Retries after a failed or expired ProvisioningRequest. v1beta2 moved these
+  # settings here from AdmissionCheck.spec.retryDelayMinutes.
+  retryStrategy:
+    backoffLimitCount: {{ .Values.capacityAwareAdmission.admissionCheck.retryLimit }}
+    backoffBaseSeconds: {{ .Values.capacityAwareAdmission.admissionCheck.minBackoffSeconds }}
+    backoffMaxSeconds: {{ .Values.capacityAwareAdmission.admissionCheck.maxBackoffSeconds }}
 ---
 # AdmissionCheck instructs Kueue to gate admission until CA confirms
 # the ProvisioningRequest has been fulfilled (Provisioned: True).
@@ -44,7 +50,6 @@ metadata:
     app.kubernetes.io/component: capacity-aware-admission
 spec:
   controllerName: kueue.x-k8s.io/provisioning-request
-  retryDelayMinutes: {{ div .Values.capacityAwareAdmission.admissionCheck.minBackoffSeconds 60 }}
   parameters:
     apiGroup: kueue.x-k8s.io
     kind: ProvisioningRequestConfig
@@ -52,7 +57,7 @@ spec:
 ---
 # ResourceFlavor for GPU nodes that scale from zero. The node labels must
 # match the AKS agentpool labels set by the Terraform node pool definition.
-apiVersion: kueue.x-k8s.io/v1beta1
+apiVersion: kueue.x-k8s.io/v1beta2
 kind: ResourceFlavor
 metadata:
   name: {{ .Values.capacityAwareAdmission.gpuFlavor.name }}

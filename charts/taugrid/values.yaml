@@ -200,9 +200,10 @@ capacityAwareAdmission:
 
   admissionCheck:
     name: taugrid-provisioning-admission-check
-    # Kueue retries the AdmissionCheck up to retryLimit times after failure.
+    # Rendered into ProvisioningRequestConfig.spec.retryStrategy.
+    # Kueue retries a failed ProvisioningRequest up to retryLimit times.
     retryLimit: 3
-    # Back-off window between retries (seconds). retryDelayMinutes = minBackoffSeconds / 60.
+    # Exponential back-off window between retries (seconds).
     minBackoffSeconds: 60
     maxBackoffSeconds: 1800
 

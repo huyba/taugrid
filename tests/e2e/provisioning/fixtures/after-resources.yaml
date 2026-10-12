@@ -1,0 +1,73 @@
+---
+# "After": capacity-aware admission. Identical to before-resources.yaml except
+# that the ClusterQueue is gated by a ProvisioningRequest AdmissionCheck, so
+# Kueue resumes a workload only after Cluster Autoscaler reports its capacity
+# as provisioned.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: e2e-capacity-after
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ProvisioningRequestConfig
+metadata:
+  name: e2e-capacity-after-config
+spec:
+  provisioningClassName: best-effort-atomic-scale-up.autoscaling.x-k8s.io
+  managedResources:
+  - cpu
+  parameters:
+    ValidUntilSeconds: "600"
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: AdmissionCheck
+metadata:
+  name: e2e-capacity-after-check
+spec:
+  controllerName: kueue.x-k8s.io/provisioning-request
+  parameters:
+    apiGroup: kueue.x-k8s.io
+    kind: ProvisioningRequestConfig
+    name: e2e-capacity-after-config
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ResourceFlavor
+metadata:
+  name: e2e-capacity-after-flavor
+spec:
+  nodeLabels:
+    "{{PROVISIONING_NODE_SELECTOR_KEY}}": "{{PROVISIONING_NODE_SELECTOR_VALUE}}"
+  tolerations:
+  - key: "{{PROVISIONING_NODE_SELECTOR_KEY}}"
+    operator: Equal
+    value: "{{PROVISIONING_NODE_SELECTOR_VALUE}}"
+    effect: NoSchedule
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ClusterQueue
+metadata:
+  name: e2e-capacity-after-cq
+spec:
+  namespaceSelector: {}
+  resourceGroups:
+  - coveredResources:
+    - "cpu"
+    flavors:
+    - name: e2e-capacity-after-flavor
+      resources:
+      - name: "cpu"
+        nominalQuota: 1000
+  queueingStrategy: BestEffortFIFO
+  admissionChecksStrategy:
+    admissionChecks:
+    - name: e2e-capacity-after-check
+      onFlavors:
+      - e2e-capacity-after-flavor
+---
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: LocalQueue
+metadata:
+  name: e2e-capacity-queue
+  namespace: e2e-capacity-after
+spec:
+  clusterQueue: e2e-capacity-after-cq

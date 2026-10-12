@@ -21,7 +21,7 @@ const provisioningRequestAdmissionCheckController = "kueue.x-k8s.io/provisioning
 
 var provisioningRequestConfigGVK = schema.GroupVersionKind{
 	Group:   "kueue.x-k8s.io",
-	Version: "v1beta1",
+	Version: "v1beta2",
 	Kind:    "ProvisioningRequestConfig",
 }
 
