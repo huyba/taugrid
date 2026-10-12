@@ -58,14 +58,38 @@ The three storage tiers are classified automatically based on access pattern:
 
 ---
 
-The current TauGrid storage relies on static BlobFuse2 mounts. This causes
+The current TauGrid storage implementation relies heavily on static volume mappings
+(`/data/`) backed directly by BlobFuse2 (Azure Blob CSI Driver). This introduces
 three critical engineering pain points:
 
 | Pain Point | Root Cause | Impact |
 |---|---|---|
-| **GPU Starvation** | BlobFuse2 maps POSIX `read()` → synchronous HTTP REST | GPUs idle waiting for data |
-| **Checkpoint path mismatch** | `tau run` writes to `/data/projects/.../checkpoints/`, `tau serve` prepends `/data/checkpoints/` (Issue #208) | Deployment failures |
-| **RWX gridlock** | Azure Blob lacks microsecond synchronisation; managed disk is RWO | Ray/PyTorch state mismatch |
+| **I/O Bottleneck & GPU Underutilization** | BlobFuse2 maps POSIX `read()` → synchronous HTTP REST | GPUs idle waiting for data |
+| **Checkpoint Logic Contradiction** | `tau run` writes to `/data/projects/.../checkpoints/`, `tau serve` prepends `/data/checkpoints/` ([Issue #208](https://github.com/Azure/taugrid/issues/208)) | Deployment failures; BlobFuse2 too slow for multi-GB checkpoints; RWO disk breaks multi-node |
+| **Shared Working State Gridlock** | Azure Blob lacks microsecond synchronisation; managed disk is RWO | Ray/PyTorch state mismatch across workers |
+
+**1. I/O Bottleneck & GPU Underutilization**
+
+Training modern Deep Learning models (Vision/LLMs) requires high-throughput, low-latency
+data feeding. BlobFuse2 translates OS POSIX filesystem calls (`read`, `open`) into
+synchronous HTTP REST API calls. Millions of small files cause high connection overhead,
+starving the GPUs (GPU Idle state).
+
+**2. The Checkpoint Logic Contradiction**
+
+There is an active path mismatch bug between `tau run` and `tau serve`
+([Issue #208](https://github.com/Azure/taugrid/issues/208)). Training writes checkpoints
+to `/data/projects/<workspace>/runs/<run-name>/checkpoints/`, but `tau serve deploy`
+automatically prepends `/data/checkpoints/` to deployment paths. Furthermore, storing
+massive checkpoint files (tens of GBs) over BlobFuse2 is too slow, while using Azure
+Managed Disk (ReadWriteOnce) breaks multi-node recoverability and scaling.
+
+**3. Shared Working State Gridlock**
+
+Distributed training workers (PyTorch Elastic/Ray) need a unified, low-latency,
+concurrent-write storage layer (ReadWriteMany). Azure Blob Storage lacks microsecond
+synchronization, causing state mismatch, whereas standard block storage cannot be shared
+among hundreds of scattered compute nodes.
 
 ---
 
