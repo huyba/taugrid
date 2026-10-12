@@ -420,6 +420,23 @@ kubectl get cluster -o jsonpath='{.status.conditions[?(@.type=="ProvisioningRead
 
 ---
 
+## Worked Example
+
+A concrete end-to-end runbook using the `helmdeep-aks` AKS cluster is in
+[`docs/design/examples/cpu-demo/README.md`](examples/cpu-demo/README.md).
+
+It uses the `check-capacity` provisioning class on a single CPU node to demonstrate
+the full ProvisioningRequest → AdmissionCheck → Workload admission flow without
+requiring GPU nodes. The Kueue code path is identical to the GPU production path.
+
+**Key results recorded from the run:**
+- ProvisioningRequest created by Kueue within **~2s** of job submission
+- `check-capacity` resolves `Provisioned: True` within **~18s**
+- Kueue sets `suspend: false` → pod reaches `Running` in **~20s** total
+- Full end-to-end with 500m CPU workload on `Standard_B2pls_v2` (1 node)
+
+---
+
 ## Follow-up Checklist
 
 - [ ] Wire `ProvisioningReadiness` reader in `cmd/controller/main.go` behind a feature flag / env var
