@@ -302,6 +302,118 @@ tau-sidecar boot
 | **Checkpoints** | Periodic model weights | RWO (local) → RWM (cloud) | Azure Premium SSD + Blob | inotify .done markers + async sidecar |
 | **Shared State** | Ray/PyTorch coordination | RWX | Azure Files Premium NFS 4.1 | NFS v4.1 nconnect=4, rsize/wsize=1MiB |
 
+### Shared Working State — Use Cases and Design Fit
+
+The `sharedState` tier provisions a single Azure Files Premium RWX PVC mounted
+at `/data/shared` across every worker pod in the job. Because the webhook injects
+the same volume definition from the same `DataIngestion` CR into every pod, all
+workers automatically share the same mount path with no per-worker configuration.
+
+The following patterns cover the typical coordination needs of distributed training:
+
+#### 1. Rendezvous / Barrier Sync
+
+Each worker writes its own ready marker — one file per worker, one writer per file,
+so there is no contention:
+
+```
+/data/shared/ready/
+├── worker-0.ready
+├── worker-1.ready
+└── worker-2.ready
+```
+
+Rank 0 polls until all N files exist, then writes `go.signal`. Workers unblock and
+start the epoch together. No distributed locking is required because each file has
+exactly one writer.
+
+#### 2. Heartbeat / Fault Detection
+
+Each worker updates its own file on a timer (e.g. every 30 seconds):
+
+```
+/data/shared/heartbeat/
+├── worker-0    # contains last-updated Unix timestamp
+├── worker-1
+└── worker-2
+```
+
+Rank 0 reads all heartbeat files. A stale timestamp (> N seconds old) signals that
+the worker has died. Rank 0 can then trigger a restart, re-shard work, or alert the
+researcher. The `tau-sidecar` binary already runs in every pod and can be extended
+to write a heartbeat on a ticker goroutine alongside its checkpoint-watching loop.
+
+#### 3. Global Step / Epoch Counter
+
+Rank 0 is the single writer. All other workers read:
+
+```
+/data/shared/global_step.txt    # "epoch=42 step=15340 loss=0.31"
+```
+
+Azure Files Premium with `nconnect=4` and `rsize=1MiB` makes these small reads
+fast. Workers read this once per epoch rather than computing step counts
+independently, which prevents drift in elastic training scenarios.
+
+#### 4. Best Checkpoint Pointer — Resolves Issue #208
+
+This is the most operationally significant pattern. Instead of hardcoding checkpoint
+paths in both `tau run` and `tau serve`, rank 0 writes a pointer file:
+
+```
+/data/shared/best_model.txt
+# epoch=42  loss=0.31  blob=runs/my-training-run/model_042.pt
+```
+
+`tau serve` reads this file to discover which checkpoint to pull from Azure Blob.
+Both `run` and `serve` mount the same NFS volume, so the path is always authoritative.
+The path mismatch between `tau run` (`/data/projects/<ws>/runs/<run>/checkpoints/`)
+and `tau serve` (`/data/checkpoints/`) disappears — not because a hardcoded string
+was fixed, but because the path is now **data, not config**.
+
+#### 5. Elastic Membership (torchrun / PyTorch Elastic)
+
+Each worker writes its rank, world size, and pod IP at startup:
+
+```
+/data/shared/membership/
+├── worker-0.json    # {"rank":0,"world_size":4,"addr":"10.0.1.5:29500"}
+├── worker-1.json
+└── worker-2.json
+```
+
+Workers discover the coordinator address by reading `worker-0.json`. This replaces
+the need for a separate Redis or etcd per training run — useful on AKS where
+provisioning extra infrastructure per job adds cost and latency.
+
+#### 6. Config Broadcast
+
+Rank 0 writes a generated config once at startup:
+
+```
+/data/shared/config.json    # hyperparameters, dataset shards, run metadata
+```
+
+Because the webhook injects the NFS mount before any container starts (init
+containers run first, then the training container), `/data/shared` is already
+mounted and readable by the time training code runs. No race between config write
+and config read.
+
+#### Summary
+
+| Use Case | Writer | Readers | Contention Risk |
+|---|---|---|---|
+| Rendezvous | Each worker (own file) | Rank 0 | None — one writer per file |
+| Heartbeat | Each worker (own file) | Rank 0 | None — one writer per file |
+| Global step | Rank 0 only | All workers | None — single writer |
+| Best checkpoint pointer | Rank 0 only | `tau serve`, all workers | None — single writer |
+| Elastic membership | Each worker (own file) | All workers | None — one writer per file |
+| Config broadcast | Rank 0 only | All workers | None — written once before readers start |
+
+The consistent pattern is: **one file per writer, rank 0 as the only global
+coordinator**. NFS advisory locking (`fcntl`) over Azure Files is unreliable and
+unnecessary when this convention is followed.
+
 ### Azure Files NFS StorageClass
 
 ```yaml
