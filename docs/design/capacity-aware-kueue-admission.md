@@ -467,6 +467,70 @@ kubectl get cluster -o jsonpath='{.status.conditions[?(@.type=="ProvisioningRead
 
 ## Worked Example
 
+### Problems and outcomes
+
+How each problem this design set out to solve fared once it was run on AKS
+(CPU nodes, upstream Kueue v0.20.1). Evidence for every row is in
+[`examples/README.md`](examples/README.md).
+
+| # | Problem | What the design does | Outcome |
+|---|---------|----------------------|---------|
+| 1 | Kueue admits on quota alone, so the Job is resumed and pods sit `Pending` with no node | ProvisioningRequest AdmissionCheck on the ClusterQueue | Solved and tested |
+| 2 | Quota is held by a job that cannot run, and later jobs are blocked until someone cleans up by hand | Provisioning timeout in tau-core-controller | Solved and tested; off by default, not yet run from a deployed image |
+| 3 | A partial scale-up leaves a Ray head running without its workers | `best-effort-atomic-scale-up` provisioning class | Configured, not tested |
+| 4 | Researchers cannot tell queue wait from scale-up wait from capacity that will never come | The reason is recorded on cluster objects; a CLI phase is designed | Partly: the information exists, the CLI does not show it |
+| 5 | Platform engineers cannot tell whether the capacity gate is wired correctly | `ProvisioningReady` condition on TauCluster | Built, not wired into `main.go` |
+
+**1. Pods created before nodes exist.** With quota-only admission the Job was
+admitted in under a second, resumed, and its pod sat `Pending` with no node for
+about 75 seconds. With the gate, Kueue asks the autoscaler for capacity first
+and resumes the Job only on `Provisioned=True`: the Job stayed suspended with no
+pod for 84 seconds while the pool scaled from zero, and the pod started on a
+node that already existed. `TestAfterSuccess` asserts that admission never
+precedes provisioning.
+
+**2. Quota taken but not used.** A job whose capacity never arrives holds its
+quota, and the next job is refused with "insufficient unused quota". The gate
+alone does not fix this: the AKS autoscaler never fails a request it cannot
+satisfy, so Kueue kept the quota reserved, unchanged over a 21-minute watch.
+The provisioning timeout closes the gap. With a 45s timeout the stuck Workload
+was deactivated 45 seconds after reserving quota, its ProvisioningRequest was
+deleted, and the starved job got the quota. Separately, when a request is
+marked `Failed`, Kueue released the quota itself after its 60s retry backoff;
+that failure was simulated. Limits: the timeout is off by default, must be
+longer than a normal scale-up (about 85s here), and a timed-out job is not
+retried.
+
+**3. Partial scale-up.** Asking for 8 nodes and getting 4 would leave a
+half-built Ray cluster holding resources. The `best-effort-atomic-scale-up`
+class is meant to provision all nodes or none. This is unproven: every test
+used a one-pod job on a pool capped at one node, so atomicity was never
+exercised.
+
+**4. Why is my job waiting?** `Pending` used to look the same whether the job
+was queued, scaling up, or never going to get capacity. With the gate these are
+distinguishable on the cluster: "insufficient unused quota" on the Workload for
+queue wait, `Accepted` on the ProvisioningRequest while scaling up,
+`CapacityIsNotFound` when there is no capacity, and a `ProvisioningTimeout`
+event on termination. That helps only someone using `kubectl`. The
+`Capacity Provisioning` phase in `tau run status --watch` is not implemented.
+
+**5. Is the gate wired correctly?** A misconfigured AdmissionCheck silently
+blocks or bypasses the gate. The `ProvisioningReady` observer is meant to
+report this, but it is never instantiated in `main.go`, so the condition always
+reads `NotConfigured`.
+
+Running the design also corrected three things it had wrong or missing:
+
+- AKS does not ship the ProvisioningRequest CRD, and without it Kueue silently
+  disables the feature. The runbook now installs it.
+- The chart objects used an API version and a field that Kueue v0.20.1 rejects.
+  Both are fixed.
+- The claim that quota is released immediately when capacity is missing was
+  false on AKS, which is what led to the provisioning timeout.
+
+### End-to-end run
+
 The flow was run end to end on the `helmdeep-aks` AKS cluster on 2026-10-12
 with upstream Kueue v0.20.1 and `best-effort-atomic-scale-up`. The full log,
 manifests and cleanup steps are in
